@@ -3463,8 +3463,12 @@ class TestLocalReduce:
             f = function([vx, vy, vz], out, on_unused_input="ignore", mode=self.mode)
             assert (f(x, y, z) == res).all(), out
             topo = f.maker.fgraph.toposort()
-            assert len(topo) <= 2, out
-            assert isinstance(topo[-1].op, Elemwise), out
+            assert any(
+                [
+                    isinstance(topo[-1].op, node)
+                    for node in [Elemwise, aet.extra_ops.BroadcastTo]
+                ]
+            ), out
 
         # Test different axis for the join and the reduction
         # We must force the dtype, of otherwise, this tests will fail
