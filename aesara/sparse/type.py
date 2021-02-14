@@ -2,7 +2,7 @@ import numpy as np
 import scipy.sparse
 
 import aesara
-from aesara.graph.type import Type
+from aesara.tensor.type import TensorType
 
 
 def _is_sparse(x):
@@ -24,7 +24,7 @@ def _is_sparse(x):
     return isinstance(x, scipy.sparse.spmatrix)
 
 
-class SparseType(Type):
+class SparseType(TensorType):
     """
     Fundamental way to create a sparse node.
 
@@ -52,19 +52,19 @@ class SparseType(Type):
         "csc": scipy.sparse.csc_matrix,
         "bsr": scipy.sparse.bsr_matrix,
     }
-    dtype_set = {
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "float32",
-        "uint8",
-        "uint16",
-        "uint32",
-        "uint64",
-        "float64",
-        "complex64",
-        "complex128",
+    dtype_specs_map = {
+        "float32": (float, "npy_float32", "NPY_FLOAT32"),
+        "float64": (float, "npy_float64", "NPY_FLOAT64"),
+        "uint8": (int, "npy_uint8", "NPY_UINT8"),
+        "int8": (int, "npy_int8", "NPY_INT8"),
+        "uint16": (int, "npy_uint16", "NPY_UINT16"),
+        "int16": (int, "npy_int16", "NPY_INT16"),
+        "uint32": (int, "npy_uint32", "NPY_UINT32"),
+        "int32": (int, "npy_int32", "NPY_INT32"),
+        "uint64": (int, "npy_uint64", "NPY_UINT64"),
+        "int64": (int, "npy_int64", "NPY_INT64"),
+        "complex128": (complex, "aesara_complex128", "NPY_COMPLEX128"),
+        "complex64": (complex, "aesara_complex64", "NPY_COMPLEX64"),
     }
     ndim = 2
 
@@ -72,28 +72,25 @@ class SparseType(Type):
     Variable = None
     Constant = None
 
-    def __init__(self, format, dtype, shape=None):
-        dtype = str(dtype)
-        if dtype in self.dtype_set:
-            self.dtype = dtype
-        else:
-            raise NotImplementedError(
-                f'unsupported dtype "{dtype}" not in list', list(self.dtype_set)
-            )
-
+    def __init__(self, format, dtype, shape=None, broadcastable=None, name=None):
         if shape is None:
             shape = (None, None)
 
         self.shape = shape
 
-        assert isinstance(format, str)
+        if not isinstance(format, str):
+            raise TypeError("The sparse format parameter must be a string")
+
         if format in self.format_cls:
             self.format = format
         else:
             raise NotImplementedError(
                 f'unsupported format "{format}" not in list',
-                list(self.format_cls.keys()),
             )
+        if broadcastable is None:
+            broadcastable = [False, False]
+
+        super().__init__(dtype, shape, name=name)
 
     def clone(self, format=None, dtype=None, shape=None, **kwargs):
         if format is None:
@@ -150,24 +147,21 @@ class SparseType(Type):
                 return True
         return False
 
-    def make_variable(self, name=None):
-        return self.Variable(self, name=name)
+    def convert_variable(self, var):
+        res = super().convert_variable(var)
 
-    def __eq__(self, other):
-        return (
-            type(self) == type(other)
-            and other.dtype == self.dtype
-            and other.format == self.format
-        )
+        if res and not isinstance(res.type, SparseType):
+            # TODO: Which format do we assign during conversion from a dense
+            # type?
+            raise NotImplementedError()
+
+        return res
 
     def __hash__(self):
-        return hash(self.dtype) ^ hash(self.format)
-
-    def __str__(self):
-        return f"Sparse[{self.dtype}, {self.format}]"
+        return super().__hash__() ^ hash(self.format)
 
     def __repr__(self):
-        return f"Sparse[{self.dtype}, {self.format}]"
+        return f"Sparse({self.dtype}, {self.shape}, {self.format})"
 
     def values_eq_approx(self, a, b, eps=1e-6):
         # WARNING: equality comparison of sparse matrices is not fast or easy
@@ -209,6 +203,31 @@ class SparseType(Type):
             shape_info[1] * np.dtype(self.dtype).itemsize
             + (shape_info[2] + shape_info[3]) * np.dtype("int32").itemsize
         )
+
+    def value_zeros(self, shape):
+        matrix_constructor = getattr(scipy.sparse, f"{self.format}_matrix", None)
+
+        if matrix_constructor is None:
+            raise ValueError(f"Sparse matrix type {self.format} not found in SciPy")
+
+        return matrix_constructor(shape, dtype=self.dtype)
+
+    def __eq__(self, other):
+        res = super().__eq__(other)
+
+        if isinstance(res, bool):
+            return res and other.format == self.format
+
+        return res
+
+    def is_super(self, otype):
+        if not super().is_super(otype):
+            return False
+
+        if self.format == otype.format:
+            return True
+
+        return False
 
 
 # Register SparseType's C code for ViewOp.

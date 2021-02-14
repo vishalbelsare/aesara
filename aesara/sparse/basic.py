@@ -47,6 +47,7 @@ from aesara.tensor.type import TensorType
 from aesara.tensor.type import continuous_dtypes as tensor_continuous_dtypes
 from aesara.tensor.type import discrete_dtypes as tensor_discrete_dtypes
 from aesara.tensor.type import iscalar, ivector, scalar, tensor, vector
+from aesara.tensor.var import TensorConstant, TensorVariable, _tensor_py_operators
 
 
 sparse_formats = ["csc", "csr"]
@@ -124,8 +125,7 @@ def _is_dense(x):
     return isinstance(x, np.ndarray)
 
 
-# Wrapper type
-def as_sparse_variable(x, name=None):
+def as_sparse_variable(x, name=None, ndim=None, **kwargs):
     """
     Wrapper around SparseVariable constructor to construct
     a Variable with a sparse matrix with the same dtype and
@@ -248,7 +248,7 @@ def sp_zeros_like(x):
     )
 
 
-class _sparse_py_operators:
+class _sparse_py_operators(_tensor_py_operators):
     T = property(
         lambda self: transpose(self), doc="Return aliased transpose of self (read-only)"
     )
@@ -359,8 +359,7 @@ class _sparse_py_operators:
         return ret
 
 
-class SparseVariable(_sparse_py_operators, Variable):
-    dtype = property(lambda self: self.type.dtype)
+class SparseVariable(_sparse_py_operators, TensorVariable):
     format = property(lambda self: self.type.format)
 
     def __str__(self):
@@ -393,8 +392,7 @@ class SparseConstantSignature(tuple):
         return hash_from_sparse(d)
 
 
-class SparseConstant(Constant, _sparse_py_operators):
-    dtype = property(lambda self: self.type.dtype)
+class SparseConstant(TensorConstant, _sparse_py_operators):
     format = property(lambda self: self.type.format)
 
     def signature(self):
@@ -446,7 +444,7 @@ csc_fmatrix = SparseType(format="csc", dtype="float32")
 csr_fmatrix = SparseType(format="csr", dtype="float32")
 bsr_fmatrix = SparseType(format="bsr", dtype="float32")
 
-all_dtypes = SparseType.dtype_set
+all_dtypes = list(SparseType.dtype_specs_map.keys())
 complex_dtypes = [t for t in all_dtypes if t[:7] == "complex"]
 float_dtypes = [t for t in all_dtypes if t[:5] == "float"]
 int_dtypes = [t for t in all_dtypes if t[:3] == "int"]
@@ -924,6 +922,12 @@ class DenseFromSparse(Op):
     def __str__(self):
         return f"{self.__class__.__name__}{{structured_grad={self.sparse_grad}}}"
 
+    def __call__(self, x):
+        if not isinstance(x.type, SparseType):
+            return x
+
+        return super().__call__(x)
+
     def make_node(self, x):
         x = as_sparse_variable(x)
         return Apply(
@@ -1000,6 +1004,12 @@ class SparseFromDense(Op):
 
     def __str__(self):
         return f"{self.__class__.__name__}{{{self.format}}}"
+
+    def __call__(self, x):
+        if isinstance(x.type, SparseType):
+            return x
+
+        return super().__call__(x)
 
     def make_node(self, x):
         x = at.as_tensor_variable(x)
