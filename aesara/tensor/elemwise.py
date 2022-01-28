@@ -231,6 +231,7 @@ class DimShuffle(ExternalCOp):
         shape = list(res.shape[: len(self.shuffle)])
         for augm in self.augment:
             shape.insert(augm, 1)
+
         res = res.reshape(shape)
 
         if not self.inplace:
