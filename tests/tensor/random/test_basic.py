@@ -1,4 +1,5 @@
 import pickle
+import re
 from copy import copy
 
 import numpy as np
@@ -13,8 +14,7 @@ from aesara.configdefaults import config
 from aesara.graph.basic import Constant, Variable, graph_inputs
 from aesara.graph.fg import FunctionGraph
 from aesara.graph.op import get_test_value
-from aesara.graph.optdb import OptimizationQuery
-from aesara.tensor.basic_opt import ShapeFeature
+from aesara.graph.rewriting.db import RewriteDatabaseQuery
 from aesara.tensor.random.basic import (
     bernoulli,
     beta,
@@ -27,7 +27,9 @@ from aesara.tensor.random.basic import (
     choice,
     dirichlet,
     exponential,
+    f,
     gamma,
+    gengamma,
     geometric,
     gumbel,
     halfcauchy,
@@ -45,21 +47,32 @@ from aesara.tensor.random.basic import (
     pareto,
     permutation,
     poisson,
+    power,
     randint,
+    random,
+    rayleigh,
+    standard_cauchy,
+    standard_exponential,
+    standard_gamma,
     standard_normal,
+    standard_t,
+    t,
     triangular,
     truncexpon,
     uniform,
     vonmises,
     wald,
     weibull,
+    zipf,
 )
+from aesara.tensor.rewriting.shape import ShapeFeature
 from aesara.tensor.type import iscalar, scalar, tensor
+from tests import unittest_tools as utt
 from tests.unittest_tools import create_aesara_param
 
 
-opts = OptimizationQuery(include=[None], exclude=["cxx_only", "BlasOpt"])
-py_mode = Mode("py", opts)
+rewrites_query = RewriteDatabaseQuery(include=[None], exclude=["cxx_only", "BlasOpt"])
+py_mode = Mode("py", rewrites_query)
 
 
 def fixed_scipy_rvs(rvs_name):
@@ -86,7 +99,7 @@ def compare_sample_values(rv, *params, rng=None, test_fn=None, **kwargs):
 
     """
     if rng is None:
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed=utt.fetch_seed())
 
     if test_fn is None:
         name = getattr(rv, "name", None)
@@ -300,6 +313,35 @@ def test_normal_default_args():
     compare_sample_values(standard_normal)
 
 
+def test_std_cauchy_default_args():
+    compare_sample_values(standard_cauchy, test_fn=fixed_scipy_rvs("cauchy"))
+
+
+@pytest.mark.parametrize(
+    "shape, size",
+    [
+        (np.array(10, dtype=config.floatX), None),
+        (np.array(2.5, dtype=config.floatX), 10000),
+    ],
+)
+def test_standard_gamma_args(shape, size):
+    gamma_test_fn = fixed_scipy_rvs("gamma")
+
+    def test_fn(shape, **kwargs):
+        return gamma_test_fn(shape, scale=1.0, **kwargs)
+
+    compare_sample_values(
+        standard_gamma,
+        shape,
+        size=size,
+        test_fn=test_fn,
+    )
+
+
+def test_random_default_args():
+    compare_sample_values(random)
+
+
 @pytest.mark.parametrize(
     "mean, sigma, size",
     [
@@ -408,6 +450,44 @@ def test_exponential_samples(lam, size):
 
 def test_exponential_default_args():
     compare_sample_values(exponential)
+
+
+@pytest.mark.parametrize(
+    "size",
+    [
+        (10_000,),
+        None,
+        (100, 100),
+    ],
+)
+def test_std_exponential_args(size):
+    compare_sample_values(standard_exponential, size=size)
+
+
+def test_rayleigh_default_args():
+    compare_sample_values(rayleigh)
+
+
+@pytest.mark.parametrize(
+    "a, size",
+    [
+        (0.5, None),
+        (2.3, 1000),
+    ],
+)
+def test_power_samples(a, size):
+    compare_sample_values(power, a, size=size)
+
+
+@pytest.mark.parametrize(
+    "a, size",
+    [
+        (1.5, None),
+        (5.5, 1000),
+    ],
+)
+def test_zipf_samples(a, size):
+    compare_sample_values(zipf, a, size=size)
 
 
 @pytest.mark.parametrize(
@@ -578,9 +658,9 @@ def test_mvnormal_samples(mu, cov, size):
 def test_mvnormal_default_args():
     compare_sample_values(multivariate_normal, test_fn=mvnormal_test_fn)
 
-    with pytest.raises(ValueError, match="shape mismatch.*"):
+    with pytest.raises(ValueError, match="operands could not be broadcast together "):
         multivariate_normal.rng_fn(
-            None, np.zeros((1, 2)), np.ones((1, 2, 2)), size=(4,)
+            None, np.zeros((3, 2)), np.ones((3, 2, 2)), size=(4,)
         )
 
 
@@ -604,7 +684,7 @@ def test_mvnormal_ShapeFeature():
     assert M_at in graph_inputs([s2])
 
     # Test broadcasted shapes
-    mean = tensor(config.floatX, [True, False])
+    mean = tensor(config.floatX, shape=(1, None))
     mean.tag.test_value = np.array([[0, 1, 2]], dtype=config.floatX)
 
     test_covar = np.diag(np.array([1, 10, 100], dtype=config.floatX))
@@ -654,10 +734,16 @@ def test_dirichlet_samples(alphas, size):
 def test_dirichlet_rng():
     alphas = np.array([[100, 1, 1], [1, 100, 1], [1, 1, 100]], dtype=config.floatX)
 
-    with pytest.raises(ValueError, match="shape mismatch.*"):
-        # The independent dimension's shape is missing from size (i.e. should
-        # be `(10, 2, 3)`)
+    with pytest.raises(ValueError, match="operands could not be broadcast together"):
+        # The independent dimension's shape cannot be broadcasted from (3,) to (10, 2)
         dirichlet.rng_fn(None, alphas, size=(10, 2))
+
+    with pytest.raises(
+        ValueError, match="input operand has more dimensions than allowed"
+    ):
+        # One of the independent dimension's shape is missing from size
+        # (i.e. should be `(1, 3)`)
+        dirichlet.rng_fn(None, np.broadcast_to(alphas, (1, 3, 3)), size=(3,))
 
 
 M_at = iscalar("M")
@@ -919,6 +1005,76 @@ def test_truncexpon_samples(b, loc, scale, size):
 
 
 @pytest.mark.parametrize(
+    "df, loc, scale, size",
+    [
+        (
+            np.array(2, dtype=config.floatX),
+            np.array(0, dtype=config.floatX),
+            np.array(1, dtype=config.floatX),
+            None,
+        ),
+        (
+            np.array(2, dtype=config.floatX),
+            np.array(0, dtype=config.floatX),
+            np.array(1, dtype=config.floatX),
+            [],
+        ),
+        (
+            np.array(2, dtype=config.floatX),
+            np.array(0, dtype=config.floatX),
+            np.array(1, dtype=config.floatX),
+            [2, 3],
+        ),
+        (
+            np.full((1, 2), 5, dtype=config.floatX),
+            np.array(0, dtype=config.floatX),
+            np.array(1, dtype=config.floatX),
+            None,
+        ),
+    ],
+)
+def test_t_samples(df, loc, scale, size):
+    compare_sample_values(
+        t,
+        df,
+        loc,
+        scale,
+        size=size,
+        test_fn=lambda *args, size=None, random_state=None, **kwargs: t.rng_fn(
+            random_state, *(args + (size,))
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "df, size",
+    [
+        (
+            np.array(2, dtype=config.floatX),
+            None,
+        ),
+        (
+            np.array(2.30, dtype=config.floatX),
+            [2, 3],
+        ),
+        (
+            np.full((1, 2), 5, dtype=config.floatX),
+            None,
+        ),
+    ],
+)
+def test_standard_t_samples(df, size):
+    compare_sample_values(
+        standard_t,
+        df,
+        size=size,
+        test_fn=lambda df, size=None, random_state=None, **kwargs: t.rng_fn(
+            random_state, df, 0.0, 1.0, size
+        ),
+    )
+
+
+@pytest.mark.parametrize(
     "p, size",
     [
         (
@@ -1088,6 +1244,48 @@ def test_betabinom_samples(M, a, p, size):
 
 
 @pytest.mark.parametrize(
+    "alpha, p, lambd, size",
+    [
+        (
+            np.array(2, dtype=config.floatX),
+            np.array(3, dtype=config.floatX),
+            np.array(5, dtype=config.floatX),
+            None,
+        ),
+        (
+            np.array(1, dtype=config.floatX),
+            np.array(1, dtype=config.floatX),
+            np.array(10, dtype=config.floatX),
+            [],
+        ),
+        (
+            np.array(2, dtype=config.floatX),
+            np.array(2, dtype=config.floatX),
+            np.array(10, dtype=config.floatX),
+            [2, 3],
+        ),
+        (
+            np.full((1, 2), 2, dtype=config.floatX),
+            np.array(2, dtype=config.floatX),
+            np.array(10, dtype=config.floatX),
+            None,
+        ),
+    ],
+)
+def test_gengamma_samples(alpha, p, lambd, size):
+    compare_sample_values(
+        gengamma,
+        alpha,
+        p,
+        lambd,
+        size=size,
+        test_fn=lambda *args, size=None, random_state=None, **kwargs: gengamma.rng_fn(
+            random_state, *(args + (size,))
+        ),
+    )
+
+
+@pytest.mark.parametrize(
     "M, p, size, test_fn",
     [
         (
@@ -1146,10 +1344,16 @@ def test_multinomial_rng():
     test_M = np.array([10, 20], dtype=np.int64)
     test_p = np.array([[0.999, 0.001], [0.001, 0.999]], dtype=config.floatX)
 
-    with pytest.raises(ValueError, match="shape mismatch.*"):
-        # The independent dimension's shape is missing from size (i.e. should
-        # be `(1, 2)`)
+    with pytest.raises(ValueError, match="operands could not be broadcast together"):
+        # The independent dimension's shape cannot be broadcasted from (2,) to (1,)
         multinomial.rng_fn(None, test_M, test_p, size=(1,))
+
+    with pytest.raises(
+        ValueError, match="input operand has more dimensions than allowed"
+    ):
+        # One of the independent dimension's shape is missing from size
+        # (i.e. should be `(5, 2)`)
+        multinomial.rng_fn(None, np.broadcast_to(test_M, (5, 2)), test_p, size=(2,))
 
 
 @pytest.mark.parametrize(
@@ -1174,10 +1378,15 @@ def test_multinomial_rng():
             (10, 2, 3),
             lambda *args, **kwargs: np.tile(np.arange(3).astype(np.int64), (10, 2, 1)),
         ),
+        (
+            np.full((4, 1, 3), [100000, 1, 1], dtype=config.floatX),
+            (4, 2),
+            lambda *args, **kwargs: np.zeros((4, 2), dtype=np.int64),
+        ),
     ],
 )
 def test_categorical_samples(p, size, test_fn):
-    p = p / p.sum(axis=-1)
+    p = p / p.sum(axis=-1, keepdims=True)
     rng = np.random.default_rng(232)
 
     compare_sample_values(
@@ -1196,11 +1405,23 @@ def test_categorical_basic():
     rng = np.random.default_rng()
 
     with pytest.raises(ValueError):
-        categorical.rng_fn(rng, p, size=10)
+        # The independent dimension of p has shape=(3,) which cannot be
+        # broadcasted to (10,)
+        categorical.rng_fn(rng, p, size=(10,))
+
+    msg = re.escape("`size` is incompatible with the shape of `p`")
+    with pytest.raises(ValueError, match=msg):
+        # The independent dimension of p has shape=(3,) which cannot be
+        # broadcasted to (1,)
+        categorical.rng_fn(rng, p, size=(1,))
+
+    with pytest.raises(ValueError, match=msg):
+        # The independent dimensions of p have shape=(1, 3) which cannot be
+        # broadcasted to (3,)
+        categorical.rng_fn(rng, p[None], size=(3,))
 
 
 def test_randint_samples():
-
     with pytest.raises(TypeError):
         randint(10, rng=shared(np.random.default_rng()))
 
@@ -1222,7 +1443,6 @@ def test_randint_samples():
 
 
 def test_integers_samples():
-
     with pytest.raises(TypeError):
         integers(10, rng=shared(np.random.RandomState()))
 
@@ -1247,17 +1467,28 @@ def test_choice_samples():
     with pytest.raises(NotImplementedError):
         choice._supp_shape_from_params(np.asarray(5))
 
+    compare_sample_values(choice, np.asarray(5))
     compare_sample_values(choice, np.asarray([5]))
     compare_sample_values(choice, np.array([1.0, 5.0], dtype=config.floatX))
     compare_sample_values(choice, np.asarray([5]), 3)
 
-    with pytest.raises(ValueError):
-        compare_sample_values(choice, np.array([[1, 2], [3, 4]]))
+    compare_sample_values(choice, np.array([[1, 2], [3, 4]]))
+    compare_sample_values(choice, np.array([[1, 2], [3, 4]]), p=[0.4, 0.6])
 
     compare_sample_values(choice, [1, 2, 3], 1)
+
     compare_sample_values(
         choice, [1, 2, 3], 1, p=at.as_tensor([1 / 3.0, 1 / 3.0, 1 / 3.0])
     )
+
+    # p must be 1-dimensional.
+    # TODO: The exception is raised at runtime but could be raised at compile
+    # time in some situations using static shape analysis.
+    with pytest.raises(ValueError):
+        rng = np.random.default_rng()
+        rng_at = shared(rng, borrow=True)
+        choice(a=[1, 2], p=at.as_tensor([[0.1, 0.9], [0.3, 0.7]]), rng=rng_at).eval()
+
     compare_sample_values(choice, [1, 2, 3], (10, 2), replace=True)
     compare_sample_values(choice, at.as_tensor_variable([1, 2, 3]), 2, replace=True)
 
@@ -1283,3 +1514,16 @@ def test_pickle():
     a_unpkl = pickle.loads(a_pkl)
 
     assert a_unpkl.owner.op._props() == sample_a.owner.op._props()
+
+
+@pytest.mark.parametrize(
+    "dfn, dfd",
+    [
+        (1, 1),
+        (2, 2),
+        (5, 10),
+        (10, 5),
+    ],
+)
+def test_f_samples(dfn, dfd):
+    compare_sample_values(f, dfn, dfd)

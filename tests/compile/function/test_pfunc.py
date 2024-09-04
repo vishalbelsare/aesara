@@ -36,6 +36,22 @@ def data_of(s):
 
 
 class TestPfunc:
+    def test_errors(self):
+        a = lscalar()
+        b = shared(1)
+
+        with pytest.raises(TypeError):
+            pfunc({a}, a + b)
+
+        with pytest.raises(TypeError):
+            pfunc([a], a + b, no_default_updates=1)
+
+        with pytest.raises(TypeError):
+            pfunc([a], a + b, updates=[{b, a}])
+
+        with pytest.raises(TypeError):
+            pfunc([a], a + b, updates=[(1, b)])
+
     def test_doc(self):
         # Ensure the code given in pfunc.txt works as expected
 
@@ -63,7 +79,6 @@ class TestPfunc:
         assert f2(4) == 32
 
     def test_shared(self):
-
         # CHECK: two functions (f1 and f2) can share w
         w = shared(np.random.random((2, 2)), "w")
         wval = w.get_value(borrow=False)
@@ -102,7 +117,7 @@ class TestPfunc:
         # function, as a 'state' that can be updated at will.
 
         rng = np.random.default_rng(1827)
-        w_init = rng.random((5))
+        w_init = rng.random(5)
         w = shared(w_init.copy(), "w")
         reg = at_sum(w * w)
         f = pfunc([], reg)
@@ -122,14 +137,13 @@ class TestPfunc:
         assert f() == 1
 
     def test_param_strict(self):
-
         a = dvector()
         b = shared(7)
         out = a + b
 
         f = pfunc([In(a, strict=False)], [out])
         # works, random( generates float64 by default
-        f(np.random.random((8)))
+        f(np.random.random(8))
         # works, casting is allowed
         f(np.array([1, 2, 3, 4], dtype="int32"))
 
@@ -146,14 +160,14 @@ class TestPfunc:
 
         # using mutable=True will let fip change the value in aval
         fip = pfunc([In(a, mutable=True)], [a_out], mode="FAST_RUN")
-        aval = np.random.random((10))
+        aval = np.random.random(10)
         aval2 = aval.copy()
         assert np.all(fip(aval) == (aval2 * 2))
         assert not np.all(aval == aval2)
 
         # using mutable=False should leave the input untouched
         f = pfunc([In(a, mutable=False)], [a_out], mode="FAST_RUN")
-        aval = np.random.random((10))
+        aval = np.random.random(10)
         aval2 = aval.copy()
         assert np.all(f(aval) == (aval2 * 2))
         assert np.all(aval == aval2)
@@ -432,7 +446,8 @@ class TestPfunc:
         f()
         assert x.get_value() == 1
 
-        del x.default_update
+        x.default_update = None
+
         f()
         assert x.get_value() == 2
 
@@ -791,7 +806,6 @@ class TestAliasingRules:
         assert np.allclose(vals.todense(), bogus_vals.todense())
 
     def test_input_aliasing_affecting_inplace_operations(self):
-
         # Note: to trigger this bug with aesara rev 4586:2bc6fc7f218b,
         #        you need to make in inputs mutable (so that inplace
         #        operations are used) and to break the elemwise composition
@@ -845,7 +859,6 @@ class TestAliasingRules:
         assert np.allclose(vals, bogus_vals)
 
     def test_partial_input_aliasing_affecting_inplace_operations(self):
-
         # Note: to trigger this bug with aesara rev 4586:2bc6fc7f218b,
         #        you need to make in inputs mutable ( so that inplace
         #        operations are used) and to break the elemwise composition
@@ -892,7 +905,6 @@ class TestAliasingRules:
         assert np.allclose(vals, bogus_vals)
 
     def test_potential_output_aliasing_induced_by_updates(self):
-
         A = self.shared(np.zeros((2, 2)))
         B = self.shared(np.zeros((2, 2)))
         C = np.zeros((2, 2))
@@ -1048,10 +1060,39 @@ class TestRebuildStrict:
         assert np.all(z_val == np.ones((3, 5)) * np.arange(5))
 
 
-def test_rebuild_collect_shared():
-
+def test_rebuild_collect_shared_validation():
     x, y = ivectors("x", "y")
     z = x * y
 
     with pytest.raises(TypeError):
         rebuild_collect_shared([z], replace={1: 2})
+
+
+def test_rebuild_collect_shared_updates():
+    """Make sure that replaced variables with default updates don't include the updates."""
+
+    srng = at.random.RandomStream(239)
+
+    x = srng.gamma(0.5, 0.5, name="x")
+    y = srng.normal(x, name="y")
+
+    inputs = [x]
+    x_rng, y_rng = x.owner.inputs[0], y.owner.inputs[0]
+    shared_inputs = [x_rng, y_rng]
+    outputs = [y]
+    x_dmy, y_dmy = x_rng.type(), y_rng.type()
+    replacements = {x_rng: x_dmy, y_rng: y_dmy}
+
+    new = rebuild_collect_shared(
+        outputs,
+        inputs=inputs + shared_inputs,
+        replace=replacements,
+        copy_inputs_over=False,
+    )
+    (
+        local_inputs,
+        local_outputs,
+        (clone_d, update_d, update_expr, new_shared_inputs),
+    ) = new
+
+    assert not update_d

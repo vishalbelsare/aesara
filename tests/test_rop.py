@@ -25,9 +25,9 @@ from aesara.graph.basic import Apply
 from aesara.graph.op import Op
 from aesara.tensor.math import argmax, dot
 from aesara.tensor.math import max as at_max
-from aesara.tensor.nnet import conv, conv2d
+from aesara.tensor.shape import unbroadcast
 from aesara.tensor.signal.pool import Pool
-from aesara.tensor.type import TensorType, matrix, vector
+from aesara.tensor.type import matrix, vector
 from tests import unittest_tools as utt
 
 
@@ -237,11 +237,11 @@ class TestRopLop(RopLopChecker):
         # vector
         self.check_rop_lop(self.x[:4].dimshuffle("x", 0).sum(axis=0), (4,))
 
-    def test_rebroadcast(self):
+    def test_unbroadcast(self):
         # I need the sum, because the setup expects the output to be a
         # vector
         self.check_rop_lop(
-            at.unbroadcast(self.x[:4].dimshuffle("x", 0), 0).sum(axis=1), (1,)
+            unbroadcast(self.x[:4].dimshuffle("x", 0), 0).sum(axis=1), (1,)
         )
 
     @pytest.mark.slow
@@ -301,62 +301,6 @@ class TestRopLop(RopLopChecker):
             v2 = scan_f()
             assert np.allclose(v1, v2), f"Rop mismatch: {v1} {v2}"
 
-    def test_conv(self):
-        for conv_op in [conv.conv2d, conv2d]:
-            for border_mode in ["valid", "full"]:
-                image_shape = (2, 2, 4, 5)
-                filter_shape = (2, 2, 2, 3)
-                image_dim = len(image_shape)
-                filter_dim = len(filter_shape)
-                input = TensorType(aesara.config.floatX, [False] * image_dim)(
-                    name="input"
-                )
-                filters = TensorType(aesara.config.floatX, [False] * filter_dim)(
-                    name="filter"
-                )
-                ev_input = TensorType(aesara.config.floatX, [False] * image_dim)(
-                    name="ev_input"
-                )
-                ev_filters = TensorType(aesara.config.floatX, [False] * filter_dim)(
-                    name="ev_filters"
-                )
-
-                def sym_conv2d(input, filters):
-                    return conv_op(input, filters, border_mode=border_mode)
-
-                output = sym_conv2d(input, filters).flatten()
-                yv = Rop(output, [input, filters], [ev_input, ev_filters])
-                mode = None
-                if aesara.config.mode == "FAST_COMPILE":
-                    mode = "FAST_RUN"
-                rop_f = function(
-                    [input, filters, ev_input, ev_filters],
-                    yv,
-                    on_unused_input="ignore",
-                    mode=mode,
-                )
-                sy, _ = aesara.scan(
-                    lambda i, y, x1, x2, v1, v2: (grad(y[i], x1) * v1).sum()
-                    + (grad(y[i], x2) * v2).sum(),
-                    sequences=at.arange(output.shape[0]),
-                    non_sequences=[output, input, filters, ev_input, ev_filters],
-                    mode=mode,
-                )
-                scan_f = function(
-                    [input, filters, ev_input, ev_filters],
-                    sy,
-                    on_unused_input="ignore",
-                    mode=mode,
-                )
-                dtype = aesara.config.floatX
-                image_data = np.random.random(image_shape).astype(dtype)
-                filter_data = np.random.random(filter_shape).astype(dtype)
-                ev_image_data = np.random.random(image_shape).astype(dtype)
-                ev_filter_data = np.random.random(filter_shape).astype(dtype)
-                v1 = rop_f(image_data, filter_data, ev_image_data, ev_filter_data)
-                v2 = scan_f(image_data, filter_data, ev_image_data, ev_filter_data)
-                assert np.allclose(v1, v2), f"Rop mismatch: {v1} {v2}"
-
     def test_join(self):
         tv = np.asarray(self.rng.uniform(size=(10,)), aesara.config.floatX)
         t = aesara.shared(tv)
@@ -384,7 +328,7 @@ class TestRopLop(RopLopChecker):
         self.check_mat_rop_lop(self.mx.sum(axis=1), (self.mat_in_shape[0],))
 
     def test_softmax(self):
-        self.check_rop_lop(aesara.tensor.nnet.softmax(self.x), self.in_shape)
+        self.check_rop_lop(aesara.tensor.special.softmax(self.x), self.in_shape)
 
     def test_alloc(self):
         # Alloc of the sum of x into a vector

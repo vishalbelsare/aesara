@@ -21,11 +21,11 @@ class LoadFromDisk(Op):
 
     """
 
-    __props__ = ("dtype", "broadcastable", "mmap_mode")
+    __props__ = ("dtype", "shape", "mmap_mode")
 
-    def __init__(self, dtype, broadcastable, mmap_mode=None):
+    def __init__(self, dtype, shape, mmap_mode=None):
         self.dtype = np.dtype(dtype)  # turn "float64" into np.float64
-        self.broadcastable = broadcastable
+        self.shape = shape
         if mmap_mode not in (None, "c"):
             raise ValueError(
                 "The only supported values for mmap_mode "
@@ -36,7 +36,7 @@ class LoadFromDisk(Op):
     def make_node(self, path):
         if isinstance(path, str):
             path = Constant(Generic(), path)
-        return Apply(self, [path], [tensor(self.dtype, shape=self.broadcastable)])
+        return Apply(self, [path], [tensor(self.dtype, shape=self.shape)])
 
     def perform(self, node, inp, out):
         path = inp[0]
@@ -50,14 +50,14 @@ class LoadFromDisk(Op):
         out[0][0] = result
 
     def __str__(self):
-        return "Load{{dtype: {}, broadcastable: {}, mmep: {}}}".format(
+        return "Load{{dtype: {}, shape: {}, mmep: {}}}".format(
             self.dtype,
-            self.broadcastable,
+            self.shape,
             self.mmap_mode,
         )
 
 
-def load(path, dtype, broadcastable, mmap_mode=None):
+def load(path, dtype, shape, mmap_mode=None):
     """
     Load an array from an .npy file.
 
@@ -67,10 +67,8 @@ def load(path, dtype, broadcastable, mmap_mode=None):
         A Generic symbolic variable, that will contain a string
     dtype : data-type
         The data type of the array to be read.
-    broadcastable
-        The broadcastable pattern of the loaded array, for instance,
-        (False,) for a vector, (False, True) for a column,
-        (False, False) for a matrix.
+    shape
+        The static shape information of the loaded array.
     mmap_mode
         How the file will be loaded. None means that the
         data will be copied into an array in memory, 'c' means that the file
@@ -82,8 +80,8 @@ def load(path, dtype, broadcastable, mmap_mode=None):
     Examples
     --------
     >>> from aesara import *
-    >>> path = Variable(Generic())
-    >>> x = tensor.load(path, 'int64', (False,))
+    >>> path = Variable(Generic(), None)
+    >>> x = tensor.load(path, 'int64', (None,))
     >>> y = x*2
     >>> fn = function([path], y)
     >>> fn("stored-array.npy")  # doctest: +SKIP
@@ -91,7 +89,7 @@ def load(path, dtype, broadcastable, mmap_mode=None):
 
     """
 
-    return LoadFromDisk(dtype, broadcastable, mmap_mode)(path)
+    return LoadFromDisk(dtype, shape, mmap_mode)(path)
 
 
 ##########################
@@ -129,20 +127,19 @@ class MPIRecv(Op):
         self.tag = tag
         self.shape = shape
         self.dtype = np.dtype(dtype)  # turn "float64" into numpy.float64
-        self.broadcastable = (False,) * len(shape)
+        self.static_shape = (None,) * len(shape)
 
     def make_node(self):
         return Apply(
             self,
             [],
             [
-                Variable(Generic()),
-                tensor(self.dtype, shape=self.broadcastable),
+                Variable(Generic(), None),
+                tensor(self.dtype, shape=self.static_shape),
             ],
         )
 
     def perform(self, node, inp, out):
-
         data = np.zeros(self.shape, dtype=self.dtype)
         request = comm.Irecv(data, self.source, self.tag)
 
@@ -182,11 +179,10 @@ class MPIRecvWait(Op):
         return Apply(
             self,
             [request, data],
-            [tensor(data.dtype, shape=data.broadcastable)],
+            [tensor(data.dtype, shape=data.type.shape)],
         )
 
     def perform(self, node, inp, out):
-
         request = inp[0]
         data = inp[1]
 
@@ -222,12 +218,11 @@ class MPISend(Op):
         self.tag = tag
 
     def make_node(self, data):
-        return Apply(self, [data], [Variable(Generic()), data.type()])
+        return Apply(self, [data], [Variable(Generic(), None), data.type()])
 
     view_map = {1: [0]}
 
     def perform(self, node, inp, out):
-
         data = inp[0]
 
         request = comm.Isend(data, self.dest, self.tag)
@@ -259,7 +254,7 @@ class MPISendWait(Op):
         self.tag = tag
 
     def make_node(self, request, data):
-        return Apply(self, [request, data], [Variable(Generic())])
+        return Apply(self, [request, data], [Variable(Generic(), None)])
 
     def perform(self, node, inp, out):
         request = inp[0]

@@ -8,7 +8,7 @@ from collections import Counter, defaultdict
 from keyword import iskeyword
 from operator import itemgetter
 from tempfile import NamedTemporaryFile
-from textwrap import indent
+from textwrap import dedent, indent
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -243,7 +243,7 @@ def gc_helper(node_list: List[Apply]):
     -------
     2-tuple
         FIRST, the set of Variable instances which are computed by node_list,
-        and SECOND a dictionary that maps each Variable instance to a the last
+        and SECOND a dictionary that maps each Variable instance to the last
         node to use Variable as an input.
 
     Extended Summary
@@ -393,7 +393,6 @@ def raise_with_op(
         )
 
     if verbosity == "high":
-
         import aesara.printing
 
         f = io.StringIO()
@@ -591,7 +590,6 @@ def compile_function_src(
     global_env: Optional[Dict[Any, Any]] = None,
     local_env: Optional[Dict[Any, Any]] = None,
 ) -> Callable:
-
     with NamedTemporaryFile(delete=False) as f:
         filename = f.name
         f.write(src.encode())
@@ -613,8 +611,8 @@ def compile_function_src(
 def get_name_for_object(x: Any) -> str:
     """Get the name for an arbitrary object."""
 
-    if isinstance(x, Variable):
-        name = re.sub("[^0-9a-zA-Z]+", "_", x.name) if x.name else ""
+    if isinstance(x, Variable) and x.name:
+        name = re.sub("[^0-9a-zA-Z]+", "_", x.name)
         name = (
             name
             if (
@@ -622,19 +620,22 @@ def get_name_for_object(x: Any) -> str:
                 and not iskeyword(name)
                 and name not in dir(builtins)
             )
-            else x.auto_name
+            else ""
         )
     else:
-        name = getattr(x, "__name__", "")
+        name = re.sub(r"(?<!^)(?=[A-Z])", "_", getattr(x, "__name__", "")).lower()
 
     if not name or (not name.isidentifier() or iskeyword(name)):
-        name = type(x).__name__
+        # Try to get snake-case out of the type name
+        name = re.sub(r"(?<!^)(?=[A-Z])", "_", type(x).__name__).lower()
+
+    assert name.isidentifier() and not iskeyword(name)
 
     return name
 
 
 def unique_name_generator(
-    external_names: Optional[List[str]] = None, suffix_sep: str = ""
+    external_names: Optional[List[str]] = None, suffix_sep: str = "_"
 ) -> Callable:
     """Create a function that generates unique names."""
 
@@ -673,10 +674,8 @@ def fgraph_to_python(
     fgraph: FunctionGraph,
     op_conversion_fn: Callable,
     *,
-    type_conversion_fn: Callable = lambda x, **kwargs: x,
+    const_conversion_fn: Callable = lambda x, **kwargs: x,
     order: Optional[List[Apply]] = None,
-    input_storage: Optional["InputStorageType"] = None,
-    output_storage: Optional["OutputStorageType"] = None,
     storage_map: Optional["StorageMapType"] = None,
     fgraph_name: str = "fgraph_to_python",
     global_env: Optional[Dict[Any, Any]] = None,
@@ -685,28 +684,24 @@ def fgraph_to_python(
     squeeze_output: bool = False,
     **kwargs,
 ) -> Callable:
-    """Convert a ``FunctionGraph`` into a regular Python function.
+    """Convert a `FunctionGraph` into a regular Python function.
 
     Parameters
     ==========
     fgraph
-        The ``FunctionGraph`` to convert.
+        The `FunctionGraph` to convert.
     op_conversion_fn
-        A callable used to convert nodes inside `fgraph` based on their ``Op``
+        A callable used to convert nodes inside `fgraph` based on their `Op`
         types.  It must have the signature
         ``(op: Op, node: Apply=None, storage_map: Dict[Variable, List[Optional[Any]]]=None, **kwargs)``.
-    type_conversion_fn
-        A callable used to convert the values in `storage_map`.  It must have
+    const_conversion_fn
+        A callable used to convert the `Constant` values in `storage_map`.  It must have
         the signature
         ``(value: Optional[Any], variable: Variable=None, storage: List[Optional[Any]]=None, **kwargs)``.
     order
-        The ``order`` argument to ``map_storage``.
-    input_storage
-        The ``input_storage`` argument to ``map_storage``.
-    output_storage
-        The ``output_storage`` argument to ``map_storage``.
+        The `order` argument to `map_storage`.
     storage_map
-        The ``storage_map`` argument to ``map_storage``.
+        The `storage_map` argument to `map_storage`.
     fgraph_name
         The name used for the resulting function.
     global_env
@@ -719,7 +714,7 @@ def fgraph_to_python(
         A function used to provide names for the objects referenced within the
         generated function.
     squeeze_output
-        If the ``FunctionGraph`` has only one output and this option is
+        If the `FunctionGraph` has only one output and this option is
         ``True``, return the single output instead of a tuple with the output.
     **kwargs
         The remaining keywords are passed to `python_conversion_fn`
@@ -727,9 +722,9 @@ def fgraph_to_python(
 
     if order is None:
         order = fgraph.toposort()
-    input_storage, output_storage, storage_map = map_storage(
-        fgraph, order, input_storage, output_storage, storage_map
-    )
+
+    if storage_map is None:
+        storage_map = {}
 
     unique_name = unique_name_generator([fgraph_name])
 
@@ -749,10 +744,13 @@ def fgraph_to_python(
         node_input_names = []
         for i in node.inputs:
             local_input_name = unique_name(i)
-            if storage_map[i][0] is not None or isinstance(i, Constant):
+            input_storage = storage_map.setdefault(
+                i, [None if not isinstance(i, Constant) else i.data]
+            )
+            if input_storage[0] is not None or isinstance(i, Constant):
                 # Constants need to be assigned locally and referenced
-                global_env[local_input_name] = type_conversion_fn(
-                    storage_map[i][0], variable=i, storage=storage_map[i], **kwargs
+                global_env[local_input_name] = const_conversion_fn(
+                    input_storage[0], variable=i, storage=input_storage, **kwargs
                 )
                 # TODO: We could attempt to use the storage arrays directly
                 # E.g. `local_input_name = f"{local_input_name}[0]"`
@@ -760,9 +758,26 @@ def fgraph_to_python(
 
         node_output_names = [unique_name(v) for v in node.outputs]
 
-        assign_comment_str = f"{indent(str(node), '# ')}"
         assign_str = f"{', '.join(node_output_names)} = {local_compiled_func_name}({', '.join(node_input_names)})"
-        body_assigns.append(f"{assign_comment_str}\n{assign_str}")
+        assign_comment_str = f"{indent(str(node), '# ')}"
+        assign_block_str = f"{assign_comment_str}\n{assign_str}"
+        body_assigns.append(assign_block_str)
+
+    # Handle `Constant`-only outputs (these don't have associated `Apply`
+    # nodes, so the above isn't applicable)
+    for out in fgraph.outputs:
+        if isinstance(out, Constant):
+            local_output_name = unique_name(out)
+            if local_output_name not in global_env:
+                output_storage = storage_map.setdefault(
+                    out, [None if not isinstance(out, Constant) else out.data]
+                )
+                global_env[local_output_name] = const_conversion_fn(
+                    output_storage[0],
+                    variable=out,
+                    storage=output_storage,
+                    **kwargs,
+                )
 
     fgraph_input_names = [unique_name(v) for v in fgraph.inputs]
     fgraph_output_names = [unique_name(v) for v in fgraph.outputs]
@@ -775,11 +790,13 @@ def fgraph_to_python(
     else:
         fgraph_return_src = ", ".join(fgraph_output_names)
 
-    fgraph_def_src = f"""
-def {fgraph_name}({", ".join(fgraph_input_names)}):
-{joined_body_assigns}
-    return {fgraph_return_src}
+    fgraph_def_src = dedent(
+        f"""
+    def {fgraph_name}({", ".join(fgraph_input_names)}):
+{indent(joined_body_assigns, " " * 4)}
+        return {fgraph_return_src}
     """
+    ).strip()
 
     if local_env is None:
         local_env = locals()

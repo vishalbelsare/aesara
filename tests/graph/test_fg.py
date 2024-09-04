@@ -65,7 +65,8 @@ class TestFunctionGraph:
         assert fg.inputs == [var1, var2]
         assert fg.outputs == [var3, var4]
         assert fg.apply_nodes == {var3.owner, var4.owner}
-        assert fg.update_mapping is None
+        assert fg.update_mapping == {}
+        assert fg.inv_update_mapping == {}
         assert fg.check_integrity() is None
         assert fg.variables == {var1, var2, var3, var4}
         assert fg.get_clients(var1) == [(var3.owner, 0)]
@@ -133,7 +134,6 @@ class TestFunctionGraph:
         assert not any(o in fg.variables for o in var4.owner.outputs)
 
     def test_import_node(self):
-
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
         var3 = op1(var2, var1)
@@ -163,7 +163,6 @@ class TestFunctionGraph:
         assert (var7.owner, 0) in fg.get_clients(var2)
 
     def test_import_var(self):
-
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
         var3 = op1(var2, var1)
@@ -194,7 +193,6 @@ class TestFunctionGraph:
             fg.import_var(NullType()(), "testing")
 
     def test_change_input(self):
-
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
         var3 = op1(var2, var1)
@@ -228,7 +226,6 @@ class TestFunctionGraph:
 
     @config.change_flags(compute_test_value="raise")
     def test_replace_test_value(self):
-
         var1 = MyVariable("var1")
         var1.tag.test_value = 1
         var2 = MyVariable("var2")
@@ -248,7 +245,6 @@ class TestFunctionGraph:
             fg.replace(var4, var6)
 
     def test_replace(self):
-
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
         var3 = op1(var2, var1)
@@ -268,7 +264,6 @@ class TestFunctionGraph:
         assert var4.owner.inputs == [var1, var2]
 
     def test_replace_verbose(self, capsys):
-
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
         var3 = op1(var2, var1)
@@ -279,7 +274,7 @@ class TestFunctionGraph:
         capres = capsys.readouterr()
         assert capres.err == ""
         assert (
-            "optimizer: rewrite test-reason replaces Op1.0 of Op1(var2, var1) with var1 of None"
+            "rewriting: rewrite test-reason replaces Op1.0 of Op1(var2, var1) with var1 of None"
             in capres.out
         )
 
@@ -301,7 +296,6 @@ class TestFunctionGraph:
         assert var4.owner.inputs == [var4, var2]
 
     def test_replace_bad_state(self):
-
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
         var3 = op1(var2, var1)
@@ -317,7 +311,6 @@ class TestFunctionGraph:
             fg.replace(var1, var0)
 
     def test_check_integrity(self):
-
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
         var3 = op1(var2, var1)
@@ -383,7 +376,6 @@ class TestFunctionGraph:
             fg.check_integrity()
 
     def test_contains(self):
-
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
         var3 = op1(var2, var1)
@@ -431,7 +423,9 @@ class TestFunctionGraph:
         node2_out = op2(var2, node1_out)
         node3_out = op3(node2_out)
 
-        fg = FunctionGraph([var1, var2], [node2_out, node3_out], clone=False)
+        fg = FunctionGraph(
+            [var1, var2], [node2_out, node3_out], clone=False, update_mapping={1: 1}
+        )
 
         fg.remove_output(0)
         fg.check_integrity()
@@ -439,8 +433,12 @@ class TestFunctionGraph:
         assert fg.apply_nodes == {node1_out.owner, node2_out.owner, node3_out.owner}
         assert fg.inputs == [var1, var2]
         assert fg.outputs == [node3_out]
+        assert fg.update_mapping == {0: 1}
+        assert fg.inv_update_mapping == {1: 0}
 
-        fg = FunctionGraph([var1, var2], [node2_out, node3_out], clone=False)
+        fg = FunctionGraph(
+            [var1, var2], [node2_out, node3_out], clone=False, update_mapping={1: 0}
+        )
 
         fg.remove_output(1)
         fg.check_integrity()
@@ -448,6 +446,8 @@ class TestFunctionGraph:
         assert fg.apply_nodes == {node1_out.owner, node2_out.owner}
         assert fg.inputs == [var1, var2]
         assert fg.outputs == [node2_out]
+        assert fg.update_mapping == {}
+        assert fg.inv_update_mapping == {}
 
         fg = FunctionGraph([var1, var2], [node2_out, node3_out, var1], clone=False)
 
@@ -467,7 +467,6 @@ class TestFunctionGraph:
         assert fg.outputs == []
 
     def test_remove_output_2(self):
-
         var0 = MyVariable("var0")
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
@@ -506,7 +505,6 @@ class TestFunctionGraph:
         assert fg.outputs == [out0, out1, out2, var4]
 
     def test_remove_output_3(self):
-
         var0 = MyVariable("var0")
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
@@ -538,7 +536,6 @@ class TestFunctionGraph:
         assert out1 not in fg.clients
 
     def test_remove_input(self):
-
         var0 = MyVariable("var0")
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
@@ -554,16 +551,19 @@ class TestFunctionGraph:
         out3 = out1
 
         fg = FunctionGraph(
-            [var0, var1, var2, var3, var4],
+            [var0, var1, var4, var2, var3],
             [out0, out1, out2, out3],
             clone=False,
+            update_mapping={0: 3, 3: 2},
         )
 
-        fg.remove_input(4)
+        fg.remove_input(2)
         fg.check_integrity()
 
         assert fg.inputs == [var0, var1, var2, var3]
         assert fg.outputs == [out0]
+        assert fg.update_mapping == {0: 2}
+        assert fg.inv_update_mapping == {2: 0}
 
     def test_remove_in_and_out(self):
         var1 = MyVariable("var1")
@@ -615,7 +615,6 @@ class TestFunctionGraph:
         assert fg.outputs == []
 
     def test_remove_output_empty(self):
-
         var1 = MyVariable("var1")
         var2 = MyVariable("var2")
         op1_out = op1(var1)

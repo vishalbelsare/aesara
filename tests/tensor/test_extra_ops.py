@@ -8,8 +8,8 @@ from aesara import function
 from aesara import tensor as at
 from aesara.compile.mode import Mode
 from aesara.configdefaults import config
-from aesara.graph.basic import applys_between
-from aesara.graph.optdb import OptimizationQuery
+from aesara.graph.basic import Constant, applys_between
+from aesara.graph.rewriting.db import RewriteDatabaseQuery
 from aesara.raise_op import Assert
 from aesara.tensor.elemwise import DimShuffle
 from aesara.tensor.extra_ops import (
@@ -337,10 +337,10 @@ class TestDiff(utt.InferShapeTester):
     @pytest.mark.parametrize(
         "x_type",
         (
-            at.TensorType("float64", (None, None)),
-            at.TensorType("float64", (None, 30)),
-            at.TensorType("float64", (10, None)),
-            at.TensorType("float64", (10, 30)),
+            at.TensorType("float64", shape=(None, None)),
+            at.TensorType("float64", shape=(None, 30)),
+            at.TensorType("float64", shape=(10, None)),
+            at.TensorType("float64", shape=(10, 30)),
         ),
     )
     @pytest.mark.parametrize("axis", (-2, -1, 0, 1))
@@ -363,19 +363,19 @@ class TestSqueeze(utt.InferShapeTester):
         self.op = squeeze
 
     @pytest.mark.parametrize(
-        "shape, broadcast",
+        "shape, var_shape",
         zip(
             [(1, 3), (1, 2, 3), (1, 5, 1, 1, 6)],
             [
-                [True, False],
-                [True, False, False],
-                [True, False, True, True, False],
+                [1, None],
+                [1, None, None],
+                [1, None, 1, 1, None],
             ],
         ),
     )
-    def test_op(self, shape, broadcast):
+    def test_op(self, shape, var_shape):
         data = np.random.random(size=shape).astype(config.floatX)
-        variable = TensorType(config.floatX, broadcast)()
+        variable = TensorType(config.floatX, shape=var_shape)()
 
         f = aesara.function([variable], self.op(variable))
 
@@ -386,19 +386,19 @@ class TestSqueeze(utt.InferShapeTester):
         assert np.allclose(tested, expected)
 
     @pytest.mark.parametrize(
-        "shape, broadcast",
+        "shape, var_shape",
         zip(
             [(1, 3), (1, 2, 3), (1, 5, 1, 1, 6)],
             [
-                [True, False],
-                [True, False, False],
-                [True, False, True, True, False],
+                [1, None],
+                [1, None, None],
+                [1, None, 1, 1, None],
             ],
         ),
     )
-    def test_infer_shape(self, shape, broadcast):
+    def test_infer_shape(self, shape, var_shape):
         data = np.random.random(size=shape).astype(config.floatX)
-        variable = TensorType(config.floatX, broadcast)()
+        variable = TensorType(config.floatX, shape=var_shape)()
 
         self._compile_and_check(
             [variable], [self.op(variable)], [data], DimShuffle, warn=False
@@ -420,20 +420,20 @@ class TestSqueeze(utt.InferShapeTester):
         utt.verify_grad(self.op, [data])
 
     @pytest.mark.parametrize(
-        "shape, broadcast",
+        "shape, var_shape",
         zip(
             [(1, 3), (1, 2, 3), (1, 5, 1, 1, 6)],
             [
-                [True, False],
-                [True, False, False],
-                [True, False, True, True, False],
+                [1, None],
+                [1, None, None],
+                [1, None, 1, 1, None],
             ],
         ),
     )
-    def test_var_interface(self, shape, broadcast):
+    def test_var_interface(self, shape, var_shape):
         # same as test_op, but use a_aesara_var.squeeze.
         data = np.random.random(size=shape).astype(config.floatX)
-        variable = TensorType(config.floatX, broadcast)()
+        variable = TensorType(config.floatX, shape=var_shape)()
 
         f = aesara.function([variable], variable.squeeze())
 
@@ -444,29 +444,29 @@ class TestSqueeze(utt.InferShapeTester):
         assert np.allclose(tested, expected)
 
     def test_axis(self):
-        variable = TensorType(config.floatX, [False, True, False])()
+        variable = TensorType(config.floatX, shape=(None, 1, None))()
         res = squeeze(variable, axis=1)
 
         assert res.broadcastable == (False, False)
 
-        variable = TensorType(config.floatX, [False, True, False])()
+        variable = TensorType(config.floatX, shape=(None, 1, None))()
         res = squeeze(variable, axis=(1,))
 
         assert res.broadcastable == (False, False)
 
-        variable = TensorType(config.floatX, [False, True, False, True])()
+        variable = TensorType(config.floatX, shape=(None, 1, None, 1))()
         res = squeeze(variable, axis=(1, 3))
 
         assert res.broadcastable == (False, False)
 
-        variable = TensorType(config.floatX, [True, False, True, False, True])()
+        variable = TensorType(config.floatX, shape=(1, None, 1, None, 1))()
         res = squeeze(variable, axis=(0, -1))
 
         assert res.broadcastable == (False, True, False)
 
     def test_invalid_axis(self):
         # Test that trying to squeeze a non broadcastable dimension raises error
-        variable = TensorType(config.floatX, [True, False])()
+        variable = TensorType(config.floatX, shape=(1, None))()
         with pytest.raises(
             ValueError, match="Cannot drop a non-broadcastable dimension"
         ):
@@ -540,7 +540,7 @@ class TestRepeat(utt.InferShapeTester):
     def test_basic(self, ndim, dtype):
         rng = np.random.default_rng(4282)
 
-        x = TensorType(config.floatX, [False] * ndim)()
+        x = TensorType(config.floatX, (None,) * ndim)()
         a = rng.random((10,) * ndim).astype(config.floatX)
 
         for axis in self._possible_axis(ndim):
@@ -579,7 +579,7 @@ class TestRepeat(utt.InferShapeTester):
                 )
 
                 # check when r is  aesara tensortype that broadcastable is (True,)
-                r_var = TensorType(shape=(True,), dtype=dtype)()
+                r_var = TensorType(dtype=dtype, shape=(1,))()
                 r = rng.integers(1, 6, size=(1,)).astype(dtype)
                 f = aesara.function([x, r_var], repeat(x, r_var, axis=axis))
                 assert np.allclose(np.repeat(a, r[0], axis=axis), f(a, r))
@@ -593,7 +593,7 @@ class TestRepeat(utt.InferShapeTester):
     def test_infer_shape(self, ndim, dtype):
         rng = np.random.default_rng(4282)
 
-        x = TensorType(config.floatX, [False] * ndim)()
+        x = TensorType(config.floatX, shape=(None,) * ndim)()
         shp = (np.arange(ndim) + 1) * 3
         a = rng.random(shp).astype(config.floatX)
 
@@ -635,7 +635,7 @@ class TestRepeat(utt.InferShapeTester):
             utt.verify_grad(lambda x: Repeat(axis=axis)(x, 3), [a])
 
     def test_broadcastable(self):
-        x = TensorType(config.floatX, [False, True, False])()
+        x = TensorType(config.floatX, shape=(None, 1, None))()
         r = Repeat(axis=1)(x, 2)
         assert r.broadcastable == (False, False, False)
         r = Repeat(axis=1)(x, 1)
@@ -923,7 +923,7 @@ class TestUnique(utt.InferShapeTester):
 class TestUnravelIndex(utt.InferShapeTester):
     def test_unravel_index(self):
         def check(shape, index_ndim, order):
-            indices = np.arange(np.product(shape))
+            indices = np.arange(np.prod(shape))
             # test with scalars and higher-dimensional indices
             if index_ndim == 0:
                 indices = indices[-1]
@@ -994,7 +994,7 @@ class TestRavelMultiIndex(utt.InferShapeTester):
     def test_ravel_multi_index(self):
         def check(shape, index_ndim, mode, order):
             multi_index = np.unravel_index(
-                np.arange(np.product(shape)), shape, order=order
+                np.arange(np.prod(shape)), shape, order=order
             )
             # create some invalid indices to test the mode
             if mode in ("wrap", "clip"):
@@ -1142,6 +1142,41 @@ def test_broadcast_shape_basic():
     b_at = broadcast_shape(x_at, y_at)
     assert isinstance(b_at[-1].owner.op, Assert)
 
+    # N.B. Shared variable shape values shouldn't be treated as constants,
+    # because they can change.
+    s = aesara.shared(1)
+    b_at = broadcast_shape((s, 2), (2, 1), arrays_are_shapes=True)
+    assert isinstance(b_at[0].owner.op, Assert)
+
+
+def test_broadcast_shape_constants():
+    """Make sure `broadcast_shape` uses constants when it can."""
+    x1_shp_at = iscalar("x1")
+    y2_shp_at = iscalar("y2")
+    b_at = broadcast_shape((x1_shp_at, 2), (3, y2_shp_at), arrays_are_shapes=True)
+    assert len(b_at) == 2
+    assert isinstance(b_at[0].owner.op, Assert)
+    assert b_at[0].owner.inputs[0].value.item() == 3
+    assert isinstance(b_at[1].owner.op, Assert)
+    assert b_at[1].owner.inputs[0].value.item() == 2
+
+    b_at = broadcast_shape((1, 2), (3, 2), arrays_are_shapes=True)
+    assert len(b_at) == 2
+    assert all(isinstance(x, Constant) for x in b_at)
+    assert b_at[0].value.item() == 3
+    assert b_at[1].value.item() == 2
+
+    b_at = broadcast_shape((1,), (1, 1), arrays_are_shapes=True)
+    assert len(b_at) == 2
+    assert all(isinstance(x, Constant) for x in b_at)
+    assert b_at[0].value.item() == 1
+    assert b_at[1].value.item() == 1
+
+    b_at = broadcast_shape((1,), (1,), arrays_are_shapes=True)
+    assert len(b_at) == 1
+    assert all(isinstance(x, Constant) for x in b_at)
+    assert b_at[0].value.item() == 1
+
 
 @pytest.mark.parametrize(
     ("s1_vals", "s2_vals", "exp_res"),
@@ -1169,6 +1204,31 @@ def test_broadcast_shape_symbolic(s1_vals, s2_vals, exp_res):
     assert tuple(res.eval(eval_point)) == exp_res
 
 
+def test_broadcast_shape_symbolic_one_symbolic():
+    """Test case for a constant non-broadcast shape and a symbolic shape."""
+    one_at = at.as_tensor(1, dtype=np.int64)
+    three_at = at.as_tensor(3, dtype=np.int64)
+    int_div = one_at / one_at
+
+    assert int_div.owner.op == at.true_divide
+
+    index_shapes = [
+        (one_at, one_at, three_at),
+        (one_at, int_div, one_at),
+        (one_at, one_at, int_div),
+    ]
+
+    res_shape = broadcast_shape(*index_shapes, arrays_are_shapes=True)
+
+    from aesara.graph.rewriting.utils import rewrite_graph
+
+    res_shape = rewrite_graph(res_shape)
+
+    assert res_shape[0].data == 1
+    assert res_shape[1].data == 1
+    assert res_shape[2].data == 3
+
+
 class TestBroadcastTo(utt.InferShapeTester):
     def setup_method(self):
         super().setup_method()
@@ -1188,24 +1248,69 @@ class TestBroadcastTo(utt.InferShapeTester):
         assert y.owner.inputs[1].owner is None
         assert y.owner.inputs[2].owner is None
 
-    @config.change_flags(compute_test_value="raise")
-    def test_perform(self):
-        a = scalar()
-        a.tag.test_value = 5
-
+    @pytest.mark.parametrize("linker", ["cvm", "py"])
+    def test_perform(self, linker):
+        a = aesara.shared(5)
         s_1 = iscalar("s_1")
-        s_1.tag.test_value = 4
         shape = (s_1, 1)
 
         bcast_res = broadcast_to(a, shape)
-
         assert bcast_res.broadcastable == (False, True)
 
+        bcast_fn = aesara.function(
+            [s_1], bcast_res, mode=Mode(optimizer=None, linker=linker)
+        )
+        bcast_fn.vm.allow_gc = False
+
+        bcast_at = bcast_fn(4)
         bcast_np = np.broadcast_to(5, (4, 1))
-        bcast_at = bcast_res.get_test_value()
 
         assert np.array_equal(bcast_at, bcast_np)
-        assert np.shares_memory(bcast_at, a.get_test_value())
+
+        bcast_var = bcast_fn.maker.fgraph.outputs[0].owner.inputs[0]
+        bcast_in = bcast_fn.vm.storage_map[a]
+        bcast_out = bcast_fn.vm.storage_map[bcast_var]
+
+        if linker != "py":
+            assert np.shares_memory(bcast_out[0], bcast_in[0])
+
+    @pytest.mark.skipif(
+        not config.cxx, reason="G++ not available, so we need to skip this test."
+    )
+    def test_memory_leak(self):
+        import gc
+        import tracemalloc
+
+        from aesara.link.c.cvm import CVM
+
+        n = 100_000
+        x = aesara.shared(np.ones(n, dtype=np.float64))
+        y = broadcast_to(x, (5, n))
+
+        f = aesara.function([], y, mode=Mode(optimizer=None, linker="cvm"))
+        assert isinstance(f.vm, CVM)
+
+        assert len(f.maker.fgraph.apply_nodes) == 2
+        assert any(
+            isinstance(node.op, BroadcastTo) for node in f.maker.fgraph.apply_nodes
+        )
+
+        tracemalloc.start()
+
+        blocks_last = None
+        block_diffs = []
+        for i in range(1, 50):
+            x.set_value(np.ones(n))
+            _ = f()
+            _ = gc.collect()
+            blocks_i, _ = tracemalloc.get_traced_memory()
+            if blocks_last is not None:
+                blocks_diff = (blocks_i - blocks_last) // 10**3
+                block_diffs.append(blocks_diff)
+            blocks_last = blocks_i
+
+        tracemalloc.stop()
+        assert np.allclose(np.mean(block_diffs), 0)
 
     @pytest.mark.parametrize(
         "fn,input_dims",
@@ -1227,7 +1332,7 @@ class TestBroadcastTo(utt.InferShapeTester):
 
     def test_infer_shape(self):
         rng = np.random.default_rng(43)
-        a = tensor(config.floatX, [False, True, False])
+        a = tensor(config.floatX, shape=(None, 1, None))
         shape = list(a.shape)
         out = self.op(a, shape)
 
@@ -1238,7 +1343,7 @@ class TestBroadcastTo(utt.InferShapeTester):
             self.op_class,
         )
 
-        a = tensor(config.floatX, [False, True, False])
+        a = tensor(config.floatX, shape=(None, 1, None))
         shape = [iscalar() for i in range(4)]
         self._compile_and_check(
             [a] + shape,
@@ -1256,7 +1361,7 @@ class TestBroadcastTo(utt.InferShapeTester):
         q = b[np.r_[0, 1, 3]]
         e = at.set_subtensor(q, np.r_[0, 0, 0])
 
-        opts = OptimizationQuery(include=["inplace"])
+        opts = RewriteDatabaseQuery(include=["inplace"])
         py_mode = Mode("py", opts)
         e_fn = function([d], e, mode=py_mode)
 

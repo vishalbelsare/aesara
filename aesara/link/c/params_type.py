@@ -29,7 +29,7 @@ In your Op sub-class:
 
 .. code-block:: python
 
-    params_type = ParamsType(attr1=TensorType('int32', (False, False)), attr2=ScalarType('float64'))
+    params_type = ParamsType(attr1=TensorType('int32', shape=(None, None)), attr2=ScalarType('float64'))
 
 If your op contains attributes ``attr1`` **and** ``attr2``, the default ``op.get_params()``
 implementation will automatically try to look for it and generate an appropriate Params object.
@@ -264,10 +264,7 @@ class Params(dict):
 
     def __repr__(self):
         return "Params(%s)" % ", ".join(
-            [
-                ("{}:{}:{}".format(k, type(self[k]).__name__, self[k]))
-                for k in sorted(self.keys())
-            ]
+            [(f"{k}:{type(self[k]).__name__}:{self[k]}") for k in sorted(self.keys())]
         )
 
     def __getattr__(self, key):
@@ -324,7 +321,7 @@ class ParamsType(CType):
     `ParamsType` constructor takes key-value args.  Key will be the name of the
     attribute in the struct.  Value is the Aesara type of this attribute,
     ie. an instance of (a subclass of) :class:`CType`
-    (eg. ``TensorType('int64', (False,))``).
+    (eg. ``TensorType('int64', (None,))``).
 
     In a Python code any attribute named ``key`` will be available via::
 
@@ -430,10 +427,7 @@ class ParamsType(CType):
 
     def __repr__(self):
         return "ParamsType<%s>" % ", ".join(
-            [
-                ("{}:{}".format(self.fields[i], self.types[i]))
-                for i in range(self.length)
-            ]
+            [(f"{self.fields[i]}:{self.types[i]}") for i in range(self.length)]
         )
 
     def __eq__(self, other):
@@ -713,7 +707,6 @@ class ParamsType(CType):
         c_cleanup_list = []
         c_extract_list = []
         for attribute_name, type_instance in zip(self.fields, self.types):
-
             try:
                 # c_support_code() may return a code string or a list of code strings.
                 support_code = type_instance.c_support_code()

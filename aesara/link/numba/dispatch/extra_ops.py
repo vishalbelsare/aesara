@@ -6,7 +6,7 @@ from numba.misc.special import literal_unroll
 
 from aesara import config
 from aesara.link.numba.dispatch import basic as numba_basic
-from aesara.link.numba.dispatch.basic import get_numba_type, numba_funcify
+from aesara.link.numba.dispatch.basic import _numba_funcify, get_numba_type
 from aesara.tensor.extra_ops import (
     Bartlett,
     BroadcastTo,
@@ -21,7 +21,7 @@ from aesara.tensor.extra_ops import (
 )
 
 
-@numba_funcify.register(Bartlett)
+@_numba_funcify.register(Bartlett)
 def numba_funcify_Bartlett(op, **kwargs):
     @numba_basic.numba_njit(inline="always")
     def bartlett(x):
@@ -30,7 +30,7 @@ def numba_funcify_Bartlett(op, **kwargs):
     return bartlett
 
 
-@numba_funcify.register(CumOp)
+@_numba_funcify.register(CumOp)
 def numba_funcify_CumOp(op, node, **kwargs):
     axis = op.axis
     mode = op.mode
@@ -65,7 +65,7 @@ def numba_funcify_CumOp(op, node, **kwargs):
     return cumop
 
 
-@numba_funcify.register(FillDiagonal)
+@_numba_funcify.register(FillDiagonal)
 def numba_funcify_FillDiagonal(op, **kwargs):
     @numba_basic.numba_njit
     def filldiagonal(a, val):
@@ -75,7 +75,7 @@ def numba_funcify_FillDiagonal(op, **kwargs):
     return filldiagonal
 
 
-@numba_funcify.register(FillDiagonalOffset)
+@_numba_funcify.register(FillDiagonalOffset)
 def numba_funcify_FillDiagonalOffset(op, node, **kwargs):
     @numba_basic.numba_njit
     def filldiagonaloffset(a, val, offset):
@@ -100,9 +100,8 @@ def numba_funcify_FillDiagonalOffset(op, node, **kwargs):
     return filldiagonaloffset
 
 
-@numba_funcify.register(RavelMultiIndex)
+@_numba_funcify.register(RavelMultiIndex)
 def numba_funcify_RavelMultiIndex(op, node, **kwargs):
-
     mode = op.mode
     order = op.order
 
@@ -165,7 +164,7 @@ def numba_funcify_RavelMultiIndex(op, node, **kwargs):
     return ravelmultiindex
 
 
-@numba_funcify.register(Repeat)
+@_numba_funcify.register(Repeat)
 def numba_funcify_Repeat(op, node, **kwargs):
     axis = op.axis
 
@@ -175,7 +174,6 @@ def numba_funcify_Repeat(op, node, **kwargs):
         use_python = True
 
     if use_python:
-
         warnings.warn(
             (
                 "Numba will use object mode to allow the "
@@ -184,7 +182,7 @@ def numba_funcify_Repeat(op, node, **kwargs):
             UserWarning,
         )
 
-        ret_sig = get_numba_type(node.outputs[0].type)
+        ret_sig = get_numba_type(node.outputs[0].type, node.outputs[0])
 
         @numba_basic.numba_njit
         def repeatop(x, repeats):
@@ -210,7 +208,7 @@ def numba_funcify_Repeat(op, node, **kwargs):
     return repeatop
 
 
-@numba_funcify.register(Unique)
+@_numba_funcify.register(Unique)
 def numba_funcify_Unique(op, node, **kwargs):
     axis = op.axis
 
@@ -233,7 +231,6 @@ def numba_funcify_Unique(op, node, **kwargs):
             return np.unique(x)
 
     else:
-
         warnings.warn(
             (
                 "Numba will use object mode to allow the "
@@ -243,9 +240,11 @@ def numba_funcify_Unique(op, node, **kwargs):
         )
 
         if returns_multi:
-            ret_sig = numba.types.Tuple([get_numba_type(o.type) for o in node.outputs])
+            ret_sig = numba.types.Tuple(
+                [get_numba_type(o.type, o) for o in node.outputs]
+            )
         else:
-            ret_sig = get_numba_type(node.outputs[0].type)
+            ret_sig = get_numba_type(node.outputs[0].type, node.outputs[0])
 
         @numba_basic.numba_njit
         def unique(x):
@@ -256,7 +255,7 @@ def numba_funcify_Unique(op, node, **kwargs):
     return unique
 
 
-@numba_funcify.register(UnravelIndex)
+@_numba_funcify.register(UnravelIndex)
 def numba_funcify_UnravelIndex(op, node, **kwargs):
     order = op.order
 
@@ -291,7 +290,7 @@ def numba_funcify_UnravelIndex(op, node, **kwargs):
     return unravelindex
 
 
-@numba_funcify.register(SearchsortedOp)
+@_numba_funcify.register(SearchsortedOp)
 def numba_funcify_Searchsorted(op, node, **kwargs):
     side = op.side
 
@@ -308,7 +307,7 @@ def numba_funcify_Searchsorted(op, node, **kwargs):
             UserWarning,
         )
 
-        ret_sig = get_numba_type(node.outputs[0].type)
+        ret_sig = get_numba_type(node.outputs[0].type, node.outputs[0])
 
         @numba_basic.numba_njit
         def searchsorted(a, v, sorter):
@@ -325,9 +324,8 @@ def numba_funcify_Searchsorted(op, node, **kwargs):
     return searchsorted
 
 
-@numba_funcify.register(BroadcastTo)
+@_numba_funcify.register(BroadcastTo)
 def numba_funcify_BroadcastTo(op, node, **kwargs):
-
     create_zeros_tuple = numba_basic.create_tuple_creator(
         lambda _: 0, len(node.inputs) - 1
     )

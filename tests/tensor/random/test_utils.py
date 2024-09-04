@@ -3,7 +3,7 @@ import pytest
 
 from aesara import config, function
 from aesara.compile.mode import Mode
-from aesara.graph.optdb import OptimizationQuery
+from aesara.graph.rewriting.db import RewriteDatabaseQuery
 from aesara.tensor.random.utils import RandomStream, broadcast_params
 from aesara.tensor.type import matrix, tensor
 from tests import unittest_tools as utt
@@ -11,14 +11,13 @@ from tests import unittest_tools as utt
 
 @pytest.fixture(scope="module", autouse=True)
 def set_aesara_flags():
-    opts = OptimizationQuery(include=[None], exclude=[])
-    py_mode = Mode("py", opts)
+    rewrites_query = RewriteDatabaseQuery(include=[None], exclude=[])
+    py_mode = Mode("py", rewrites_query)
     with config.change_flags(mode=py_mode, compute_test_value="warn"):
         yield
 
 
 def test_broadcast_params():
-
     ndims_params = [0, 0]
 
     mean = np.array([0, 1, 2])
@@ -69,7 +68,7 @@ def test_broadcast_params():
 
     # Try it in Aesara
     with config.change_flags(compute_test_value="raise"):
-        mean = tensor(config.floatX, [False, True])
+        mean = tensor(config.floatX, shape=(None, 1))
         mean.tag.test_value = np.array([[0], [10], [100]], dtype=config.floatX)
         cov = matrix()
         cov.tag.test_value = np.diag(np.array([1e-6], dtype=config.floatX))
@@ -109,6 +108,10 @@ class TestSharedRandomStream:
             random.blah
 
         assert hasattr(random, "standard_normal")
+        assert hasattr(random, "standard_cauchy")
+        assert hasattr(random, "standard_gamma")
+        assert hasattr(random, "standard_exponential")
+        assert hasattr(random, "standard_t")
 
         with pytest.raises(AttributeError):
             np_random = RandomStream(namespace=np, rng_ctor=rng_ctor)
@@ -268,7 +271,7 @@ class TestSharedRandomStream:
         g2 = Graph(seed=987)
         f2 = function([], g2.y)
 
-        for (su1, su2) in zip(g1.rng.state_updates, g2.rng.state_updates):
+        for su1, su2 in zip(g1.rng.state_updates, g2.rng.state_updates):
             su2[0].set_value(su1[0].get_value())
 
         np.testing.assert_array_almost_equal(f1(), f2(), decimal=6)

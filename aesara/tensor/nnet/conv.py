@@ -26,13 +26,10 @@ import aesara
 from aesara.graph.basic import Apply
 from aesara.link.c.op import OpenMPOp
 from aesara.tensor import blas
-from aesara.tensor.basic import (
-    as_tensor_variable,
-    get_scalar_constant_value,
-    patternbroadcast,
-)
+from aesara.tensor.basic import as_tensor_variable, get_scalar_constant_value
 from aesara.tensor.exceptions import NotScalarConstantError
 from aesara.tensor.nnet.abstract_conv import get_conv_output_shape, get_conv_shape_1axis
+from aesara.tensor.shape import specify_broadcastable
 from aesara.tensor.type import discrete_dtypes, tensor
 
 
@@ -49,12 +46,13 @@ def conv2d(
     subsample=(1, 1),
     **kargs,
 ):
-    """
-    Deprecated, old conv2d interface.
-    This function will build the symbolic graph for convolving a stack of
-    input images with a set of filters. The implementation is modelled after
-    Convolutional Neural Networks (CNN). It is simply a wrapper to the ConvOp
-    but provides a much cleaner interface.
+    """Build the symbolic graph for convolving a stack of input images with a set of filters.
+
+    The implementation is modelled after Convolutional Neural Networks
+    (CNN). It is simply a wrapper to the `ConvOp` but provides a much cleaner
+    interface.
+
+    This is deprecated.
 
     Parameters
     ----------
@@ -405,8 +403,7 @@ class ConvOp(OpenMPOp):
         # with s=1 for mode=='full' and s=-1 for mode=='valid'.
         # To support symbolic shapes, we express this with integer arithmetic.
         warnings.warn(
-            "The method `getOutputShape` is deprecated use"
-            "`get_conv_output_shape` instead.",
+            "`getOutputShape` is deprecated; use `get_conv_output_shape` instead.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -524,7 +521,6 @@ class ConvOp(OpenMPOp):
             and self.unroll_batch > 0
             and self.bsize % self.unroll_batch != 0
         ):
-
             if self.bsize <= self.unroll_batch:
                 self.unroll_batch = self.bsize
             else:
@@ -550,7 +546,6 @@ class ConvOp(OpenMPOp):
             and self.unroll_kern > 0
             and self.nkern % self.unroll_kern != 0
         ):
-
             if self.nkern <= self.unroll_kern:
                 self.unroll_kern = self.nkern
             else:
@@ -742,10 +737,16 @@ class ConvOp(OpenMPOp):
                 "The image and the kernel must have the same type."
                 "inputs({_inputs.dtype}), kerns({_kerns.dtype})"
             )
-        bcastable23 = [self.outshp[0] == 1, self.outshp[1] == 1]
+        out_shape = (
+            _inputs.type.shape[0],
+            _kerns.type.shape[0],
+            self.outshp[0],
+            self.outshp[1],
+        )
+        out_shape = tuple(1 if s == 1 else None for s in out_shape)
         output = tensor(
             dtype=_inputs.type.dtype,
-            shape=[_inputs.broadcastable[0], _kerns.broadcastable[0]] + bcastable23,
+            shape=out_shape,
         )
 
         return Apply(self, [_inputs, _kerns], [output])
@@ -1103,8 +1104,14 @@ class ConvOp(OpenMPOp):
 
         # din and dw should have the same broadcasting pattern as the
         # parameters they are the gradient of (resp. inputs and kerns).
-        din = patternbroadcast(din, inputs.broadcastable)
-        dw = patternbroadcast(dw, kerns.broadcastable)
+        if din.type.broadcastable != inputs.type.broadcastable:
+            din = specify_broadcastable(
+                din, *(ax for (ax, b) in enumerate(inputs.type.broadcastable) if b)
+            )
+        if dw.type.broadcastable != kerns.type.broadcastable:
+            dw = specify_broadcastable(
+                dw, *(ax for (ax, b) in enumerate(kerns.type.broadcastable) if b)
+            )
         return [din, dw]
 
     def c_headers(self, **kwargs):

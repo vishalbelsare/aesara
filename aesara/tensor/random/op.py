@@ -14,7 +14,7 @@ from aesara.tensor.basic import (
     constant,
     get_scalar_constant_value,
     get_vector_length,
-    infer_broadcastable,
+    infer_static_shape,
 )
 from aesara.tensor.random.type import RandomGeneratorType, RandomStateType, RandomType
 from aesara.tensor.random.utils import normalize_size_param, params_broadcast_shapes
@@ -76,10 +76,8 @@ def default_supp_shape_from_params(
         ref_param = dist_params[rep_param_idx]
         if ref_param.ndim < ndim_supp:
             raise ValueError(
-                (
-                    "Reference parameter does not match the "
-                    f"expected dimensions; {ref_param} has less than {ndim_supp} dim(s)."
-                )
+                "Reference parameter does not match the "
+                f"expected dimensions; {ref_param} has less than {ndim_supp} dim(s)."
             )
         return ref_param.shape[-ndim_supp:]
 
@@ -161,12 +159,12 @@ class RandomVariable(Op):
         """
         return default_supp_shape_from_params(self.ndim_supp, dist_params, **kwargs)
 
-    def rng_fn(self, rng, *args, **kwargs):
+    def rng_fn(self, rng, *args, **kwargs) -> Union[int, float, np.ndarray]:
         """Sample a numeric random variate."""
         return getattr(rng, self.name)(*args, **kwargs)
 
     def __str__(self):
-        props_str = ", ".join((f"{getattr(self, prop)}" for prop in self.__props__[1:]))
+        props_str = ", ".join(f"{getattr(self, prop)}" for prop in self.__props__[1:])
         return f"{self.name}_rv{{{props_str}}}"
 
     def _infer_shape(
@@ -322,7 +320,7 @@ class RandomVariable(Op):
             )
 
         shape = self._infer_shape(size, dist_params)
-        _, bcast = infer_broadcastable(shape)
+        _, static_shape = infer_static_shape(shape)
         dtype = self.dtype or dtype
 
         if dtype == "floatX":
@@ -336,7 +334,7 @@ class RandomVariable(Op):
             dtype_idx = constant(dtype, dtype="int64")
             dtype = all_dtypes[dtype_idx.data]
 
-        outtype = TensorType(dtype=dtype, shape=bcast)
+        outtype = TensorType(dtype=dtype, shape=static_shape)
         out_var = outtype()
         inputs = (rng, size, dtype_idx) + dist_params
         outputs = (rng.type(), out_var)

@@ -1,5 +1,4 @@
 import copy
-import warnings
 from typing import Tuple, Union
 
 import numpy as np
@@ -45,7 +44,9 @@ class MultinomialFromUniform(COp):
             odtype = pvals.dtype
         else:
             odtype = self.odtype
-        out = at.tensor(dtype=odtype, shape=pvals.type.broadcastable)
+        out = at.tensor(
+            dtype=odtype, shape=tuple(1 if s == 1 else None for s in pvals.type.shape)
+        )
         return Apply(self, [pvals, unis, as_scalar(n)], [out])
 
     def grad(self, ins, outgrads):
@@ -435,14 +436,3 @@ class ChoiceFromUniform(MultinomialFromUniform):
                             pvals[n, m] = 0.0
                             pvals[n] /= pvals[n].sum()
                         break
-
-
-class MultinomialWOReplacementFromUniform(ChoiceFromUniform):
-    def __init__(self, *args, **kwargs):
-        warnings.warn(
-            "MultinomialWOReplacementFromUniform is deprecated, "
-            "use ChoiceFromUniform instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)

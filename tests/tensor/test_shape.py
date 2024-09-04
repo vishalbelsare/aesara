@@ -2,26 +2,32 @@ import numpy as np
 import pytest
 
 import aesara
-from aesara import Mode, function
+from aesara import Mode, function, grad
 from aesara.compile.ops import DeepCopyOp
 from aesara.configdefaults import config
 from aesara.graph.basic import Variable
 from aesara.graph.fg import FunctionGraph
+from aesara.graph.op import Op
 from aesara.graph.type import Type
 from aesara.misc.safe_asarray import _asarray
-from aesara.tensor import as_tensor_variable, get_vector_length
+from aesara.scalar.basic import ScalarConstant
+from aesara.tensor import as_tensor_variable, get_vector_length, row
 from aesara.tensor.basic import MakeVector, constant
-from aesara.tensor.basic_opt import ShapeFeature
 from aesara.tensor.elemwise import DimShuffle, Elemwise
+from aesara.tensor.rewriting.shape import ShapeFeature
 from aesara.tensor.shape import (
     Reshape,
     Shape_i,
     SpecifyShape,
+    Unbroadcast,
     _specify_shape,
     reshape,
     shape,
     shape_i,
+    shape_tuple,
+    specify_broadcastable,
     specify_shape,
+    unbroadcast,
 )
 from aesara.tensor.subtensor import Subtensor
 from aesara.tensor.type import (
@@ -35,26 +41,27 @@ from aesara.tensor.type import (
     lscalar,
     matrix,
     scalar,
+    tensor,
     tensor3,
     vector,
 )
 from aesara.tensor.type_other import NoneConst
 from aesara.tensor.var import TensorVariable
-from aesara.typed_list import make_list
 from tests import unittest_tools as utt
+from tests.graph.utils import MyType2
 from tests.tensor.utils import eval_outputs, random
 from tests.test_rop import RopLopChecker
 
 
 def test_shape_basic():
     s = shape([])
-    assert s.type.broadcastable == (True,)
+    assert s.type.shape == (1,)
 
     s = shape([10])
-    assert s.type.broadcastable == (True,)
+    assert s.type.shape == (1,)
 
     s = shape(lscalar())
-    assert s.type.broadcastable == (False,)
+    assert s.type.shape == (0,)
 
     class MyType(Type):
         def filter(self, *args, **kwargs):
@@ -63,8 +70,8 @@ def test_shape_basic():
         def __eq__(self, other):
             return isinstance(other, MyType) and other.thingy == self.thingy
 
-    s = shape(Variable(MyType()))
-    assert s.type.broadcastable == (False,)
+    s = shape(Variable(MyType(), None))
+    assert s.type.shape == (None,)
 
     s = shape(np.array(1))
     assert np.array_equal(eval_outputs([s]), [])
@@ -112,15 +119,14 @@ class TestReshape(utt.InferShapeTester, utt.OptimizationTestMixin):
         b = dmatrix()
         d = dmatrix()
 
-        # basic to 1 dim(without list)
-        c = reshape(b, as_tensor_variable(6), ndim=1)
-        f = self.function([b], c)
-
         b_val1 = np.asarray([[0, 1, 2], [3, 4, 5]])
         c_val1 = np.asarray([0, 1, 2, 3, 4, 5])
         b_val2 = b_val1.T
         c_val2 = np.asarray([0, 3, 1, 4, 2, 5])
 
+        # basic to 1 dim(without list)
+        c = reshape(b, as_tensor_variable(6), ndim=1)
+        f = self.function([b], c)
         f_out1 = f(b_val1)
         f_out2 = f(b_val2)
         assert np.array_equal(f_out1, c_val1), (f_out1, c_val1)
@@ -184,10 +190,10 @@ class TestReshape(utt.InferShapeTester, utt.OptimizationTestMixin):
             f(np.asarray([[0, 1, 2], [3, 4, 5]])),
             np.asarray([[[0], [1], [2]], [[3], [4], [5]]]),
         )
-        assert f.maker.fgraph.toposort()[-1].outputs[0].type.broadcastable == (
-            False,
-            False,
-            True,
+        assert f.maker.fgraph.toposort()[-1].outputs[0].type.shape == (
+            None,
+            None,
+            1,
         )
 
         # test broadcast flag for constant value of 1 if it cannot be
@@ -198,10 +204,10 @@ class TestReshape(utt.InferShapeTester, utt.OptimizationTestMixin):
             f(np.asarray([[0, 1, 2], [3, 4, 5]])),
             np.asarray([[[0], [1]], [[2], [3]], [[4], [5]]]),
         )
-        assert f.maker.fgraph.toposort()[-1].outputs[0].type.broadcastable == (
-            False,
-            False,
-            True,
+        assert f.maker.fgraph.toposort()[-1].outputs[0].type.shape == (
+            None,
+            None,
+            1,
         )
 
     def test_m1(self):
@@ -432,12 +438,12 @@ class TestSpecifyShape(utt.InferShapeTester):
         specify_shape = SpecifyShape()
 
         x = vector()
-        xval = np.random.random((2)).astype(config.floatX)
+        xval = np.random.random(2).astype(config.floatX)
         f = aesara.function([x], specify_shape(x, 2), mode=self.mode)
 
         assert np.array_equal(f(xval), xval)
 
-        xval = np.random.random((3)).astype(config.floatX)
+        xval = np.random.random(3).astype(config.floatX)
         with pytest.raises(AssertionError, match="SpecifyShape:.*"):
             f(xval)
 
@@ -475,7 +481,7 @@ class TestSpecifyShape(utt.InferShapeTester):
     def test_infer_shape(self):
         rng = np.random.default_rng(3453)
         adtens4 = dtensor4()
-        aivec = TensorVariable(TensorType("int64", (4,)))
+        aivec = TensorVariable(TensorType("int64", (4,)), None)
         aivec_val = [3, 4, 2, 5]
         adtens4_val = rng.random(aivec_val)
         self._compile_and_check(
@@ -498,6 +504,42 @@ class TestSpecifyShape(utt.InferShapeTester):
             SpecifyShape,
         )
 
+    def test_direct_return(self):
+        """Test that when specified shape does not provide new information, input is
+        returned directly."""
+        x = TensorType("float64", shape=(1, 2, None))("x")
+
+        assert specify_shape(x, (1, 2, None)) is x
+        assert specify_shape(x, (None, None, None)) is x
+
+        assert specify_shape(x, (1, 2, 3)) is not x
+        assert specify_shape(x, (None, None, 3)) is not x
+        assert specify_shape(x, (1, 3, None)) is not x
+
+    def test_specify_shape_in_grad(self):
+        x = matrix()
+        y = specify_shape(x, (2, 3))
+        z = y + 1
+        z_grad = grad(z.sum(), wrt=x)
+        assert isinstance(z_grad.owner.op, SpecifyShape)
+
+
+class TestSpecifyBroadcastable:
+    def test_basic(self):
+        x = matrix()
+        assert specify_broadcastable(x, 0).type.shape == (1, None)
+        assert specify_broadcastable(x, 1).type.shape == (None, 1)
+        assert specify_broadcastable(x, 0, 1).type.shape == (1, 1)
+
+        x = row()
+        assert specify_broadcastable(x, 0) is x
+        assert specify_broadcastable(x, 1) is not x
+
+    def test_validation(self):
+        x = matrix()
+        with pytest.raises(ValueError, match="^Trying to specify broadcastable of*"):
+            specify_broadcastable(x, 2)
+
 
 class TestRopLop(RopLopChecker):
     def test_shape(self):
@@ -518,12 +560,37 @@ class TestRopLop(RopLopChecker):
 
 @config.change_flags(compute_test_value="raise")
 def test_nonstandard_shapes():
-    a = tensor3(config.floatX)
+    """Make sure shape inference works when `Op.infer_shape` isn't implemented.
+
+    This also checks that the `HasShape` abstract mixin works when it isn't
+    explicitly used in a `Type` class definition.
+
+    """
+    a = tensor3(name="a", dtype=config.floatX)
     a.tag.test_value = np.random.random((2, 3, 4)).astype(config.floatX)
-    b = tensor3(config.floatX)
+    b = tensor3(name="b", dtype=config.floatX)
     b.tag.test_value = np.random.random((2, 3, 4)).astype(config.floatX)
 
-    tl = make_list([a, b])
+    class ListType(Type):
+        def filter(self, data, **kwargs):
+            return data
+
+        ndim = 1
+        shape = (None,) * 4
+
+    class MakeList(Op):
+        itypes = [a.type, b.type]
+        otypes = [ListType()]
+
+        def perform(self, node, inputs, outputs):
+            outputs[0][0] = list(inputs)
+
+    make_list = MakeList()
+    tl = make_list(a, b)
+
+    # from aesara.typed_list import make_list
+    #
+    # tl = make_list([a, b])
     tl_shape = shape(tl)
     assert np.array_equal(tl_shape.get_test_value(), (2, 2, 3, 4))
 
@@ -557,3 +624,77 @@ def test_get_vector_length():
     # Test `SpecifyShape`
     x = specify_shape(ivector(), (10,))
     assert get_vector_length(x) == 10
+
+
+class TestUnbroadcast:
+    def test_basic(self):
+        x = matrix()
+        assert unbroadcast(x, 0) is x
+        assert unbroadcast(x, 1) is x
+        assert unbroadcast(x, 1, 0) is x
+        assert unbroadcast(x, 0, 1) is x
+
+        x = row()
+        assert unbroadcast(x, 0) is not x
+        assert unbroadcast(x, 1) is x
+        assert unbroadcast(x, 1, 0) is not x
+        assert unbroadcast(x, 0, 1) is not x
+
+        assert unbroadcast(unbroadcast(x, 0), 0).owner.inputs[0] is x
+
+    def test_infer_shape(self):
+        x = matrix()
+        y = unbroadcast(x, 0)
+        f = aesara.function([x], y.shape)
+        assert (f(np.zeros((2, 5), dtype=config.floatX)) == [2, 5]).all()
+        topo = f.maker.fgraph.toposort()
+        if config.mode != "FAST_COMPILE":
+            assert len(topo) == 3
+            assert isinstance(topo[0].op, Shape_i)
+            assert isinstance(topo[1].op, Shape_i)
+            assert isinstance(topo[2].op, MakeVector)
+
+        x = row()
+        y = unbroadcast(x, 0)
+        f = aesara.function([x], y.shape)
+        assert (f(np.zeros((1, 5), dtype=config.floatX)) == [1, 5]).all()
+        topo = f.maker.fgraph.toposort()
+        if config.mode != "FAST_COMPILE":
+            assert len(topo) == 2
+            assert isinstance(topo[0].op, Shape_i)
+            assert isinstance(topo[1].op, MakeVector)
+
+    def test_error_checks(self):
+        with pytest.raises(TypeError, match="needs integer axes"):
+            Unbroadcast(0.0)
+
+        with pytest.raises(ValueError, match="^Trying to unbroadcast"):
+            Unbroadcast(1)(vector())
+
+
+class TestUnbroadcastInferShape(utt.InferShapeTester):
+    def test_basic(self):
+        rng = np.random.default_rng(3453)
+        adtens4 = tensor("float64", shape=(1, 1, 1, None))
+        adtens4_val = rng.random((1, 1, 1, 3)).astype(config.floatX)
+        self._compile_and_check(
+            [adtens4],
+            [Unbroadcast(0, 2)(adtens4)],
+            [adtens4_val],
+            Unbroadcast,
+            warn=False,
+        )
+
+
+def test_shape_tuple():
+    x = Variable(MyType2(), None, None)
+    assert shape_tuple(x) == ()
+
+    x = tensor(np.float64, shape=(1, 2, None))
+    res = shape_tuple(x)
+    assert isinstance(res, tuple)
+    assert isinstance(res[0], ScalarConstant)
+    assert res[0].data == 1
+    assert isinstance(res[1], ScalarConstant)
+    assert res[1].data == 2
+    assert not isinstance(res[2], ScalarConstant)

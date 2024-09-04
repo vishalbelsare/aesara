@@ -19,6 +19,14 @@ from aesara.scalar import bool as bool_t
 from aesara.tensor.type import TensorType, int_dtypes
 
 
+warnings.warn(
+    "The module `aesara.tensor.signal` is deprecated and will "
+    "be removed from Aesara in version 2.8.5.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
+
 def max_pool_2d_same_size(input, patch_size):
     """
     Takes as input a 4-D tensor. It sets all non maximum values
@@ -534,8 +542,10 @@ class Pool(OpenMPOp):
         if pad.dtype not in int_dtypes:
             raise TypeError("Padding parameters must be ints.")
         # If the input shape are broadcastable we can have 0 in the output shape
-        broad = x.broadcastable[:-nd] + (False,) * nd
-        out = TensorType(x.dtype, broad)
+        out_shape = tuple(
+            1 if s == 1 else None for s in x.type.shape[:-nd] + (None,) * nd
+        )
+        out = TensorType(x.dtype, shape=out_shape)
         return Apply(self, [x, ws, stride, pad], [out()])
 
     def perform(self, node, inp, out, params):
@@ -590,7 +600,7 @@ class Pool(OpenMPOp):
             yk = y[k]
             # iterate over pooling regions
             for r in np.ndindex(*pool_out_shp):
-                zzk[r] = func(yk[[region_slices[i][r[i]] for i in range(nd)]])
+                zzk[r] = func(yk[tuple(region_slices[i][r[i]] for i in range(nd))])
 
     def infer_shape(self, fgraph, node, in_shapes):
         ws, stride, pad = [node.inputs[1], node.inputs[2], node.inputs[3]]
@@ -1568,7 +1578,7 @@ class AveragePoolGrad(PoolGrad):
                 else:
                     # divide by region size
                     val = gzk[r] / region_size
-                gxk[region_slice] += val
+                gxk[tuple(region_slice)] += val
 
         # unpad the image
         gx = gx[
@@ -2200,8 +2210,10 @@ class MaxPoolRop(OpenMPOp):
         if not pad.dtype.startswith("int"):
             raise TypeError("Padding parameters must be ints.")
         # If the input shape are broadcastable we can have 0 in the output shape
-        broad = x.broadcastable[:-nd] + (False,) * nd
-        out = TensorType(eval_point.dtype, broad)
+        out_shape = tuple(
+            1 if s == 1 else None for s in x.type.shape[:-nd] + (None,) * nd
+        )
+        out = TensorType(eval_point.dtype, shape=out_shape)
         return Apply(self, [x, eval_point, ws, stride, pad], [out()])
 
     def perform(self, node, inp, out, params):

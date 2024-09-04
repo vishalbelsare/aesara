@@ -14,8 +14,6 @@ from aesara.gradient import (
     NullTypeGradError,
     Rop,
     UndefinedGrad,
-    consider_constant,
-    consider_constant_,
     disconnected_grad,
     disconnected_grad_,
     grad,
@@ -33,7 +31,7 @@ from aesara.graph.basic import Apply, graph_inputs
 from aesara.graph.null_type import NullType
 from aesara.graph.op import Op
 from aesara.sandbox.rng_mrg import MRG_RandomStream
-from aesara.tensor.math import add, dot, exp, sigmoid, sqr
+from aesara.tensor.math import add, dot, exp, sigmoid, square
 from aesara.tensor.math import sum as at_sum
 from aesara.tensor.math import tanh
 from aesara.tensor.type import (
@@ -278,8 +276,6 @@ class TestGrad:
         g = grad(a1.outputs[0], a1.outputs[1], disconnected_inputs="ignore")
         assert g.owner.op == at.fill
         assert g.owner.inputs[1].data == 0
-        with pytest.raises(TypeError):
-            grad(a1.outputs[0], "wtf")
 
     def test_NNone_rval(self):
         # grad: Test returning some zero value from grad
@@ -386,7 +382,7 @@ class TestGrad:
 
         rng = np.random.default_rng([2012, 8, 28])
 
-        vx = rng.standard_normal((2))
+        vx = rng.standard_normal(2)
 
         utt.verify_grad(output, [vx])
 
@@ -398,7 +394,7 @@ class TestGrad:
 
         rng = np.random.default_rng([2012, 8, 28])
 
-        vx = rng.standard_normal((2))
+        vx = rng.standard_normal(2)
         vA = rng.standard_normal((2, 2))
 
         utt.verify_grad(cost, [vx, vA])
@@ -411,7 +407,7 @@ class TestGrad:
 
         rng = np.random.default_rng([2012, 8, 28])
 
-        vx = rng.standard_normal((2))
+        vx = rng.standard_normal(2)
         vA = rng.standard_normal((2, 2))
 
         utt.verify_grad(output, [vx, vA])
@@ -424,7 +420,7 @@ class TestGrad:
 
         rng = np.random.default_rng([2012, 8, 28])
 
-        vx = rng.standard_normal((2))
+        vx = rng.standard_normal(2)
         vA = rng.standard_normal((2, 2))
 
         utt.verify_grad(cost, [vx, vA])
@@ -438,7 +434,7 @@ class TestGrad:
 
         rng = np.random.default_rng([2012, 8, 28])
 
-        vx = rng.standard_normal((2))
+        vx = rng.standard_normal(2)
         vA = rng.standard_normal((2, 2))
 
         utt.verify_grad(output, [vx, vA])
@@ -452,7 +448,7 @@ class TestGrad:
 
         rng = np.random.default_rng([2012, 8, 28])
 
-        vx = rng.standard_normal((2))
+        vx = rng.standard_normal(2)
         vA = rng.standard_normal((2, 2))
 
         utt.verify_grad(output, [vx, vA])
@@ -487,7 +483,7 @@ class TestGrad:
 
         X = np.cast[int_type](rng.standard_normal((m, d)) * 127.0)
         W = np.cast[W.dtype](rng.standard_normal((d, n)))
-        b = np.cast[b.dtype](rng.standard_normal((n)))
+        b = np.cast[b.dtype](rng.standard_normal(n))
 
         int_result = int_func(X, W, b)
         float_result = float_func(np.cast[float_type](X), W, b)
@@ -512,7 +508,7 @@ class TestGrad:
         # the output
         f = aesara.function([x], g)
         rng = np.random.default_rng([2012, 9, 5])
-        x = np.cast[x.dtype](rng.standard_normal((3)))
+        x = np.cast[x.dtype](rng.standard_normal(3))
         g = f(x)
         assert np.allclose(g, np.ones(x.shape, dtype=x.dtype))
 
@@ -625,7 +621,7 @@ def test_known_grads():
     p.name = "p"
     y = ct * p
     y.name = "y"
-    cost = sqr(y)
+    cost = square(y)
     cost.name = "cost"
 
     layers = [[cost], [y], [ct, p], [ct, x, ft], [coeffs, t, full_range, x]]
@@ -633,7 +629,7 @@ def test_known_grads():
     inputs = [coeffs, t, x]
 
     rng = np.random.default_rng([2012, 11, 15])
-    values = [rng.standard_normal((10)), rng.integers(10), rng.standard_normal()]
+    values = [rng.standard_normal(10), rng.integers(10), rng.standard_normal()]
     values = [np.cast[ipt.dtype](value) for ipt, value in zip(inputs, values)]
 
     true_grads = grad(cost, inputs, disconnected_inputs="ignore")
@@ -736,9 +732,9 @@ def test_subgraph_grad():
     w2 = aesara.shared(np.random.standard_normal((4, 2)))
     a1 = tanh(dot(x, w1))
     a2 = tanh(dot(a1, w2))
-    cost2 = sqr(a2 - t).sum()
-    cost2 += sqr(w2.sum())
-    cost1 = sqr(w1.sum())
+    cost2 = square(a2 - t).sum()
+    cost2 += square(w2.sum())
+    cost1 = square(w1.sum())
 
     params = [[w2], [w1]]
     costs = [cost2, cost1]
@@ -746,7 +742,7 @@ def test_subgraph_grad():
 
     inputs = [t, x]
     rng = np.random.default_rng([2012, 11, 15])
-    values = [rng.standard_normal((2)), rng.standard_normal((3))]
+    values = [rng.standard_normal(2), rng.standard_normal(3)]
     values = [np.cast[ipt.dtype](value) for ipt, value in zip(inputs, values)]
 
     wrt = [w2, w1]
@@ -771,37 +767,45 @@ def test_subgraph_grad():
 
 
 class TestConsiderConstant:
-    def setup_method(self):
-        self.rng = np.random.default_rng(seed=utt.fetch_seed())
-
     def test_op_removed(self):
+        from aesara.gradient import ConsiderConstant, consider_constant
+
         x = matrix("x")
-        y = x * consider_constant(x)
+
+        with pytest.deprecated_call():
+            y = x * consider_constant(x)
+
         f = aesara.function([x], y)
-        # need to refer to aesara.consider_constant_ here,
-        # aesara.consider_constant is a wrapper function!
-        assert consider_constant_ not in [node.op for node in f.maker.fgraph.toposort()]
 
-    def test_grad(self):
-        a = np.asarray(self.rng.standard_normal((5, 5)), dtype=config.floatX)
-
-        x = matrix("x")
-
-        expressions_gradients = [
-            (x * consider_constant(x), x),
-            (x * consider_constant(exp(x)), exp(x)),
-            (consider_constant(x), at.constant(0.0)),
-            (x**2 * consider_constant(x), 2 * x**2),
+        assert ConsiderConstant not in [
+            type(node.op) for node in f.maker.fgraph.toposort()
         ]
 
-        for expr, expr_grad in expressions_gradients:
-            g = grad(expr.sum(), x)
-            # gradient according to aesara
-            f = aesara.function([x], g, on_unused_input="ignore")
-            # desired gradient
-            f2 = aesara.function([x], expr_grad, on_unused_input="ignore")
+    def test_grad(self):
+        from aesara.gradient import consider_constant
 
-            assert np.allclose(f(a), f2(a))
+        rng = np.random.default_rng(seed=utt.fetch_seed())
+
+        a = np.asarray(rng.standard_normal((5, 5)), dtype=config.floatX)
+
+        x = matrix("x")
+
+        with pytest.deprecated_call():
+            expressions_gradients = [
+                (x * consider_constant(x), x),
+                (x * consider_constant(exp(x)), exp(x)),
+                (consider_constant(x), at.constant(0.0)),
+                (x**2 * consider_constant(x), 2 * x**2),
+            ]
+
+            for expr, expr_grad in expressions_gradients:
+                g = grad(expr.sum(), x)
+                # gradient according to aesara
+                f = aesara.function([x], g, on_unused_input="ignore")
+                # desired gradient
+                f2 = aesara.function([x], expr_grad, on_unused_input="ignore")
+
+                assert np.allclose(f(a), f2(a))
 
 
 class TestZeroGrad:
@@ -845,8 +849,8 @@ class TestZeroGrad:
         rop = Rop(y, x, v)
         f = aesara.function([x, v], rop, on_unused_input="ignore")
 
-        a = np.asarray(self.rng.standard_normal((5)), dtype=config.floatX)
-        u = np.asarray(self.rng.standard_normal((5)), dtype=config.floatX)
+        a = np.asarray(self.rng.standard_normal(5), dtype=config.floatX)
+        u = np.asarray(self.rng.standard_normal(5), dtype=config.floatX)
 
         assert np.count_nonzero(f(a, u)) == 0
 

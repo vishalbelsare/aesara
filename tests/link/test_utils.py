@@ -12,7 +12,8 @@ from aesara.link.utils import (
     get_name_for_object,
     unique_name_generator,
 )
-from aesara.scalar.basic import Add
+from aesara.scalar.basic import Add, float64
+from aesara.tensor import constant
 from aesara.tensor.elemwise import Elemwise
 from aesara.tensor.type import scalar, vector
 from aesara.tensor.type_other import NoneConst
@@ -42,7 +43,7 @@ def test_fgraph_to_python_names():
 
     x = scalar("1x")
     y = scalar("_")
-    z = scalar()
+    z = float64()
     q = scalar("def")
     r = NoneConst
 
@@ -50,9 +51,13 @@ def test_fgraph_to_python_names():
     out_jx = fgraph_to_python(out_fg, to_python)
 
     sig = inspect.signature(out_jx)
-    assert (x.auto_name, "_", z.auto_name, q.auto_name, r.name) == tuple(
-        sig.parameters.keys()
-    )
+    assert (
+        "tensor_variable",
+        "_",
+        "scalar_variable",
+        "tensor_variable_1",
+        r.name,
+    ) == tuple(sig.parameters.keys())
     assert (1, 2, 3, 4, 5) == out_jx(1, 2, 3, 4, 5)
 
     obj = object()
@@ -159,8 +164,38 @@ def test_fgraph_to_python_multiline_str():
     )
 
 
-def test_unique_name_generator():
+def test_fgraph_to_python_constant_outputs():
+    """Make sure that constant outputs are handled properly."""
 
+    y = constant(1)
+
+    out_fg = FunctionGraph([], [y], clone=False)
+
+    out_py = fgraph_to_python(out_fg, to_python)
+
+    assert out_py()[0] is y.data
+
+
+def test_fgraph_to_python_constant_inputs():
+    x = constant([1.0])
+    y = vector("y")
+
+    out = x + y
+    out_fg = FunctionGraph(outputs=[out], clone=False)
+
+    out_py = fgraph_to_python(out_fg, to_python, storage_map=None)
+
+    res = out_py(2.0)
+    assert res == (3.0,)
+
+    storage_map = {out: [None], x: [np.r_[2.0]], y: [None]}
+    out_py = fgraph_to_python(out_fg, to_python, storage_map=storage_map)
+
+    res = out_py(2.0)
+    assert res == (4.0,)
+
+
+def test_unique_name_generator():
     unique_names = unique_name_generator(["blah"], suffix_sep="_")
 
     x = vector("blah")
@@ -191,7 +226,7 @@ def test_unique_name_generator():
     q_name_1 = unique_names(q)
     q_name_2 = unique_names(q)
 
-    assert q_name_1 == q_name_2 == q.auto_name
+    assert q_name_1 == q_name_2 == "tensor_variable"
 
     unique_names = unique_name_generator()
 

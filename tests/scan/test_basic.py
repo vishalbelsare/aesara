@@ -13,13 +13,13 @@ import os
 import pickle
 import shutil
 import sys
-import timeit
 from collections import OrderedDict
 from tempfile import mkdtemp
 
 import numpy as np
 import pytest
 
+import aesara.tensor as at
 from aesara.compile.debugmode import DebugMode
 from aesara.compile.function import function
 from aesara.compile.function.pfunc import rebuild_collect_shared
@@ -31,24 +31,22 @@ from aesara.gradient import NullTypeGradError, Rop, disconnected_grad, grad, hes
 from aesara.graph.basic import Apply, ancestors, equal_computations
 from aesara.graph.fg import FunctionGraph
 from aesara.graph.op import Op
-from aesara.graph.opt import MergeOptimizer
+from aesara.graph.rewriting.basic import MergeOptimizer
 from aesara.graph.utils import MissingInputError
 from aesara.misc.safe_asarray import _asarray
 from aesara.raise_op import assert_op
 from aesara.scan.basic import scan
 from aesara.scan.op import Scan
 from aesara.scan.utils import until
-from aesara.tensor import basic as at
 from aesara.tensor.math import all as at_all
-from aesara.tensor.math import dot, mean, sigmoid
+from aesara.tensor.math import dot, exp, mean, sigmoid
 from aesara.tensor.math import sum as at_sum
 from aesara.tensor.math import tanh
-from aesara.tensor.nnet import categorical_crossentropy
 from aesara.tensor.random import normal
 from aesara.tensor.random.utils import RandomStream
 from aesara.tensor.shape import Shape_i, reshape, specify_shape
 from aesara.tensor.sharedvar import SharedVariable
-from aesara.tensor.subtensor import Subtensor, inc_subtensor
+from aesara.tensor.subtensor import Subtensor
 from aesara.tensor.type import (
     dcol,
     dmatrix,
@@ -58,7 +56,6 @@ from aesara.tensor.type import (
     fscalar,
     ftensor3,
     fvector,
-    imatrix,
     iscalar,
     ivector,
     lscalar,
@@ -69,7 +66,6 @@ from aesara.tensor.type import (
     vector,
 )
 from tests import unittest_tools as utt
-from tests.tensor.nnet.test_basic import softmax_graph
 
 
 if config.mode == "FAST_COMPILE":
@@ -83,6 +79,10 @@ else:
 
 
 type_eps = {"float64": 1e-7, "float32": 3e-3}
+
+
+def softmax_graph(c):
+    return exp(c) / exp(c).sum(axis=-1, keepdims=True)
 
 
 class multiple_outputs_numeric_grad:
@@ -281,10 +281,10 @@ class TestScan:
             n_steps=4,
         )
 
-        assert not hasattr(inner_rng, "default_update")
-        assert hasattr(inner_inner_rng, "default_update")
-        assert hasattr(y, "default_update")
-        assert hasattr(z_rng, "default_update")
+        assert inner_rng is None
+        assert inner_inner_rng.default_update is not None
+        assert y.default_update is not None
+        assert z_rng.default_update is not None
 
         out_fn = function([], out, mode=Mode(optimizer=None))
         res, z_res = out_fn()
@@ -292,7 +292,6 @@ class TestScan:
         assert len(set(z_res)) == 1
 
     def test_clone(self):
-
         a = vector()
         output, _ = scan(fn=lambda x: x**2, sequences=[a])
 
@@ -585,11 +584,6 @@ class TestScan:
         assert np.allclose(aesara_values, v_out)
 
     def test_oinp_iinp_iout_oout_mappings(self):
-        """
-        Test the mapping produces by
-        ScanOp.get_oinp_iinp_iout_oout_mappings()
-        """
-
         rng = RandomStream(123)
 
         def inner_fct(seq, mitsot, sitsot, nitsot, nseq):
@@ -824,7 +818,7 @@ class TestScan:
         assert scan_c is not scan_a
 
         g = FunctionGraph([x, y, c], [2 * scan_a, 2 * scan_b, 2 * scan_c], clone=False)
-        MergeOptimizer().optimize(g)
+        MergeOptimizer().rewrite(g)
         scan_a_out, scan_b_out, scan_c_out = g.outputs
 
         assert scan_a_out is scan_b_out
@@ -852,7 +846,7 @@ class TestScan:
         vu1 = asarrayX(rng.random((3, 2)))
         vu2 = asarrayX(rng.random((3, 3)))
         vy0 = asarrayX(rng.random((3, 2)))
-        vy1 = asarrayX(rng.random((2)))
+        vy1 = asarrayX(rng.random(2))
         vu1 = asarrayX(rng.random((3, 2)))
 
         W1 = shared(vW1, "W1")
@@ -1143,7 +1137,6 @@ class TestScan:
 
     def test_grad_sitsot(self):
         def get_sum_of_grad(inp):
-
             scan_outputs, updates = scan(
                 fn=lambda x: x * 2, outputs_info=[inp], n_steps=5
             )
@@ -2023,7 +2016,6 @@ class TestScan:
         v_eh0 = np.array(rng.uniform(size=(5,)) - 0.5, dtype=floatX)
 
         def rnn_fn(_u, _y, _W):
-
             srng = RandomStream(seed)
             tmp_val = (
                 _u + _y + srng.uniform(size=v_h0.shape) * np.asarray(1e-6, dtype=floatX)
@@ -2182,173 +2174,44 @@ def test_cvm_exception_handling(mode):
 @pytest.mark.skipif(
     not config.cxx, reason="G++ not available, so we need to skip this test."
 )
-def test_speed():
-    n_timeit = 50
+def test_cython_performance(benchmark):
+    # This implicitly confirms that the Cython version is being used
+    from aesara.scan import scan_perform_ext  # noqa: F401
 
-    # We need the CVM for this speed test
-    r = np.arange(10000).astype(config.floatX).reshape(1000, 10)
-
-    def f_py():
-        for i in range(1, 1000):
-            r[i] += r[i - 1]
-
-    python_duration = timeit.timeit(lambda: f_py(), number=n_timeit)
-
-    r = np.arange(10000).astype(config.floatX).reshape(1000, 10)
-
-    def f_py_iter():
-        r_i = iter(r[1:])
-        r_ii = iter(r[:-1])
-        while True:
-            try:
-                tmp = next(r_i)
-                tmp += next(r_ii)
-            except StopIteration:
-                break
-
-    python_iter_duration = timeit.timeit(lambda: f_py_iter(), number=n_timeit)
-
-    # r = np.arange(10000).astype(config.floatX).reshape(1000, 10)
-    # s_r = matrix()
-    # s_y, updates = scan(
-    #     fn=lambda ri, rii: ri + rii,
-    #     sequences=[s_r[1:]],
-    #     outputs_info=at.constant(r[0]),
-    #     mode=Mode(linker="cvm"),
-    # )
-    # assert not updates
-    #
-    # f_cvm = function([s_r], s_y)
-    #
-    # cvm_duration = timeit.timeit(lambda: f_cvm(r), number=n_timeit)
-
-    # XXX: Why does this take so much longer than Python?!
-    # assert cvm_duration - python_duration < python_duration * 0.15
-
-    r = np.arange(10000).astype(config.floatX).reshape(-1, 10)
-    shared_r = shared(r)
-    s_i = shared(np.array(1))
-    s_rinc = inc_subtensor(
-        shared_r[s_i], shared_r[s_i - 1], tolerate_inplace_aliasing=True
-    )
-
-    f_cvm_shared = function(
-        [],
-        [],
-        updates=OrderedDict([(s_i, s_i + 1), (shared_r, s_rinc)]),
-        mode=Mode(linker="cvm"),
-    )
-    f_cvm_shared._check_for_aliased_inputs = False
-
-    cvm_shared_duration = timeit.timeit(lambda: f_cvm_shared(), number=n_timeit)
-
-    assert cvm_shared_duration < python_duration
-    assert cvm_shared_duration < python_iter_duration
-
-
-@pytest.mark.skipif(
-    not config.cxx, reason="G++ not available, so we need to skip this test."
-)
-def test_speed_rnn():
-    n_timeit = 50
-    L = 10000
-    N = 50
-
-    np.random.seed(2523452)
-    r = np.arange(L * N).astype(config.floatX).reshape(L, N)
-    w = np.random.default_rng(utt.fetch_seed()).random((N, N)).astype(config.floatX)
+    # Python usually out-performs Aesara below 100 iterations
+    N = 200
+    M = -1 / np.arange(1, 11).astype(config.floatX)
+    r = np.arange(N * 10).astype(config.floatX).reshape(N, 10)
 
     def f_py():
-        for i in range(1, L):
-            r[i] = np.tanh(np.dot(r[i - 1], w))
+        py_out = np.empty((N, 10), dtype=config.floatX)
+        py_out[0] = r[0]
+        for i in range(1, py_out.shape[0]):
+            py_out[i] = r[i] + M * py_out[i - 1]
+        return py_out[1:]
 
-    python_duration = timeit.timeit(lambda: f_py(), number=n_timeit)
+    py_res = f_py()
 
-    # r = np.arange(L * N).astype(config.floatX).reshape(L, N)
-    # s_r = matrix()
-    # s_y, updates = scan(
-    #     fn=lambda ri, rii: tanh(dot(rii, w)),
-    #     sequences=[s_r[1:]],
-    #     outputs_info=at.constant(r[0]),
-    #     mode=Mode(linker="cvm"),
-    # )
-    # assert not updates
-    #
-    # f_cvm = function([s_r], s_y, mode=Mode(linker="cvm"))
-    #
-    # cvm_duration = timeit.timeit(lambda: f_cvm(r), number=n_timeit)
-
-    # XXX: Why does this take so much longer than Python?!
-    # assert cvm_duration - python_duration < python_duration * 0.15
-
-    r = np.arange(L * N).astype(config.floatX).reshape(L, N)
-    shared_r = shared(r)
-    s_i = shared(1)
-    s_rinc = inc_subtensor(
-        shared_r[s_i],
-        tanh(dot(shared_r[s_i - 1], w)),
-        tolerate_inplace_aliasing=True,
+    s_r = at.as_tensor_variable(r, dtype=config.floatX)
+    s_y, updates = scan(
+        fn=lambda ri, rii, M: ri + M * rii,
+        sequences=[s_r[1:]],
+        non_sequences=[at.as_tensor_variable(M, dtype=config.floatX)],
+        outputs_info=s_r[0],
+        mode=Mode(linker="cvm", optimizer="fast_run"),
     )
-    f_cvm_shared = function(
-        [],
-        [],
-        updates=OrderedDict([(s_i, s_i + 1), (shared_r, s_rinc)]),
-        mode=Mode(linker="cvm"),
-    )
+    assert not updates
 
-    cvm_shared_duration = timeit.timeit(lambda: f_cvm_shared(), number=n_timeit)
+    f_cvm = function([], s_y, mode="FAST_RUN")
+    f_cvm.trust_input = True
 
-    assert cvm_shared_duration < python_duration
+    # Make sure we're actually computing a `Scan`
+    assert any(isinstance(node.op, Scan) for node in f_cvm.maker.fgraph.apply_nodes)
 
+    cvm_res = benchmark(f_cvm)
 
-@pytest.mark.skipif(
-    not config.cxx, reason="G++ not available, so we need to skip this test."
-)
-def test_speed_batchrnn():
-    """
-    This function prints out the speed of recurrent neural network
-    calculations implemented in various ways.
-
-    We force the mode to Mode(linker='cvm'). If you manually
-    change this code to use DebugMode this will test the correctness
-    of the optimizations applied, but generally correctness-testing
-    is not the goal of this test.
-
-    The computation being tested here is a repeated tanh of a matrix-vector
-    multiplication - the heart of an ESN or RNN.
-    """
-    L = 100
-    B = 50
-    N = 400
-
-    np.random.seed(2523452)
-    r = np.arange(B * L * N).astype(config.floatX).reshape(L, B, N)
-    w = np.random.default_rng(utt.fetch_seed()).random((N, N)).astype(config.floatX)
-
-    def ref_fn():
-        for i in range(1, L):
-            r[i] = np.tanh(np.dot(r[i - 1], w))
-
-    python_duration = timeit.timeit(ref_fn, number=20)
-
-    r = np.arange(B * L * N).astype(config.floatX).reshape(L, B, N)
-    shared_r = shared(r)
-    s_i = shared(1)
-    s_rinc = inc_subtensor(
-        shared_r[s_i],
-        tanh(dot(shared_r[s_i - 1], w)),
-        tolerate_inplace_aliasing=True,
-    )
-    f = function(
-        [],
-        [],
-        updates=[(s_i, s_i + 1), (shared_r, s_rinc)],
-        mode=Mode(linker="cvm"),
-    )
-
-    cvm_duration = timeit.timeit(f, number=20)
-
-    assert cvm_duration < python_duration
+    # Make sure the results are the same between the two implementations
+    assert np.allclose(cvm_res, py_res)
 
 
 @config.change_flags(mode="FAST_COMPILE", compute_test_value="raise")
@@ -2667,7 +2530,6 @@ def test_inner_get_vector_length():
 
 @config.change_flags(mode=Mode("cvm", None))
 def test_profile_info():
-
     from aesara.scan.utils import ScanProfileStats
 
     z, updates = scan(fn=lambda u: u + 1, sequences=[at.arange(10)], profile=True)
@@ -2737,8 +2599,8 @@ class TestExamples:
             ),
             dtype="float32",
         )
-        v_bvis = np.array(rng.random((20)) - 0.5, dtype="float32")
-        v_bhid = np.array(rng.random((30)) - 0.5, dtype="float32")
+        v_bvis = np.array(rng.random(20) - 0.5, dtype="float32")
+        v_bhid = np.array(rng.random(30) - 0.5, dtype="float32")
         W = shared(v_W, "vW")
         bhid = shared(v_bhid, "vbhid")
         bvis = shared(v_bvis, "vbvis")
@@ -2785,7 +2647,7 @@ class TestExamples:
         n_result = numpy_implementation(v_vsample)
         utt.assert_allclose(t_result, n_result)
 
-    def test_reordering(self):
+    def test_reordering(self, benchmark):
         """Test re-ordering of inputs.
 
         some rnn with multiple outputs and multiple inputs; other
@@ -2845,14 +2707,14 @@ class TestExamples:
             v_x[i] = np.dot(v_u1[i], vW_in1) + v_u2[i] * vW_in2 + np.dot(v_x[i - 1], vW)
             v_y[i] = np.dot(v_x[i - 1], vWout) + v_y[i - 1]
 
-        (aesara_dump1, aesara_dump2, aesara_x, aesara_y) = f4(
-            v_u1, v_u2, v_x0, v_y0, vW_in1
+        (aesara_dump1, aesara_dump2, aesara_x, aesara_y) = benchmark(
+            f4, v_u1, v_u2, v_x0, v_y0, vW_in1
         )
 
         utt.assert_allclose(aesara_x, v_x)
         utt.assert_allclose(aesara_y, v_y)
 
-    def test_scan_as_tensor_on_gradients(self):
+    def test_scan_as_tensor_on_gradients(self, benchmark):
         to_scan = dvector("to_scan")
         seq = dmatrix("seq")
         f1 = dscalar("f1")
@@ -2866,7 +2728,12 @@ class TestExamples:
         function(inputs=[to_scan, seq, f1], outputs=scanned, allow_input_downcast=True)
 
         t_grad = grad(scanned.sum(), wrt=[to_scan, f1], consider_constant=[seq])
-        function(inputs=[to_scan, seq, f1], outputs=t_grad, allow_input_downcast=True)
+        benchmark(
+            function,
+            inputs=[to_scan, seq, f1],
+            outputs=t_grad,
+            allow_input_downcast=True,
+        )
 
     def caching_nsteps_by_scan_op(self):
         W = matrix("weights")
@@ -3083,22 +2950,6 @@ class TestExamples:
         utt.assert_allclose(outs[2], v_w + 3)
         utt.assert_allclose(sh.get_value(), v_w + 4)
 
-    def test_seq_tap_bug_jeremiah(self):
-        inp = np.arange(10).reshape(-1, 1).astype(config.floatX)
-        exp_out = np.zeros((10, 1)).astype(config.floatX)
-        exp_out[4:] = inp[:-4]
-
-        def onestep(x, x_tm4):
-            return x, x_tm4
-
-        seq = matrix()
-        initial_value = shared(np.zeros((4, 1), dtype=config.floatX))
-        outputs_info = [OrderedDict([("initial", initial_value), ("taps", [-4])]), None]
-        results, updates = scan(fn=onestep, sequences=seq, outputs_info=outputs_info)
-
-        f = function([seq], results[1])
-        assert np.all(exp_out == f(inp))
-
     def test_shared_borrow(self):
         """
         This tests two things. The first is a bug occurring when scan wrongly
@@ -3183,7 +3034,7 @@ class TestExamples:
         utt.assert_allclose(outputs, expected_outputs)
 
     @pytest.mark.slow
-    def test_hessian_bug_grad_grad_two_scans(self):
+    def test_hessian_bug_grad_grad_two_scans(self, benchmark):
         # Bug reported by Bitton Tenessi
         # NOTE : The test to reproduce the bug reported by Bitton Tenessi
         # was modified from its original version to be faster to run.
@@ -3193,7 +3044,6 @@ class TestExamples:
 
         def loss_outer(sum_outer, W):
             def loss_inner(sum_inner, W):
-
                 return sum_inner + (W**2).sum()
 
             result_inner, _ = scan(
@@ -3217,7 +3067,7 @@ class TestExamples:
         H = hessian(cost, W)
         print(".", file=sys.stderr)
         f = function([W, n_steps], H)
-        f(np.ones((8,), dtype="float32"), 1)
+        benchmark(f, np.ones((8,), dtype="float32"), 1)
 
     def test_grad_connectivity_matrix(self):
         def inner_fn(x_tm1, y_tm1, z_tm1):
@@ -3833,7 +3683,7 @@ class TestExamples:
         utt.assert_allclose(aesara_x, v_x)
         utt.assert_allclose(aesara_y, v_y)
 
-    def test_multiple_outs_taps(self):
+    def test_multiple_outs_taps(self, benchmark):
         l = 5
         rng = np.random.default_rng(utt.fetch_seed())
 
@@ -3876,86 +3726,55 @@ class TestExamples:
             [u1, u2, x0, y0, W_in1], outputs, updates=updates, allow_input_downcast=True
         )
 
-        f(v_u1, v_u2, v_x0, v_y0, vW_in1)
-
-        ny0 = np.zeros((5, 2))
-        ny1 = np.zeros((5,))
-        ny2 = np.zeros((5, 2))
-        ny0[0] = (
-            np.dot(v_u1[0], vW_in1)
-            + (v_u2[1] + v_u2[0] * v_u2[2]) * vW_in2
-            + np.dot(v_x0, vW)
-        )
-
-        ny1[0] = (v_y0[2] + v_y0[0]) * np.dot(v_x0, vWout)
-        ny2[0] = np.dot(v_u1[0], vW_in1)
-
-        ny0[1] = (
-            np.dot(v_u1[1], vW_in1)
-            + (v_u2[2] + v_u2[1] * v_u2[3]) * vW_in2
-            + np.dot(ny0[0], vW)
-        )
-
-        ny1[1] = (ny1[0] + v_y0[1]) * np.dot(ny0[0], vWout)
-        ny2[1] = np.dot(v_u1[1], vW_in1)
-
-        ny0[2] = (
-            np.dot(v_u1[2], vW_in1)
-            + (v_u2[3] + v_u2[2] * v_u2[4]) * vW_in2
-            + np.dot(ny0[1], vW)
-        )
-        ny1[2] = (ny1[1] + v_y0[2]) * np.dot(ny0[1], vWout)
-        ny2[2] = np.dot(v_u1[2], vW_in1)
-
-        ny0[3] = (
-            np.dot(v_u1[3], vW_in1)
-            + (v_u2[4] + v_u2[3] * v_u2[5]) * vW_in2
-            + np.dot(ny0[2], vW)
-        )
-
-        ny1[3] = (ny1[2] + ny1[0]) * np.dot(ny0[2], vWout)
-        ny2[3] = np.dot(v_u1[3], vW_in1)
-
-        ny0[4] = (
-            np.dot(v_u1[4], vW_in1)
-            + (v_u2[5] + v_u2[4] * v_u2[6]) * vW_in2
-            + np.dot(ny0[3], vW)
-        )
-
-        ny1[4] = (ny1[3] + ny1[1]) * np.dot(ny0[3], vWout)
-        ny2[4] = np.dot(v_u1[4], vW_in1)
+        # ny0 = np.zeros((5, 2))
+        # ny1 = np.zeros((5,))
+        # ny2 = np.zeros((5, 2))
+        # ny0[0] = (
+        #     np.dot(v_u1[0], vW_in1)
+        #     + (v_u2[1] + v_u2[0] * v_u2[2]) * vW_in2
+        #     + np.dot(v_x0, vW)
+        # )
+        #
+        # ny1[0] = (v_y0[2] + v_y0[0]) * np.dot(v_x0, vWout)
+        # ny2[0] = np.dot(v_u1[0], vW_in1)
+        #
+        # ny0[1] = (
+        #     np.dot(v_u1[1], vW_in1)
+        #     + (v_u2[2] + v_u2[1] * v_u2[3]) * vW_in2
+        #     + np.dot(ny0[0], vW)
+        # )
+        #
+        # ny1[1] = (ny1[0] + v_y0[1]) * np.dot(ny0[0], vWout)
+        # ny2[1] = np.dot(v_u1[1], vW_in1)
+        #
+        # ny0[2] = (
+        #     np.dot(v_u1[2], vW_in1)
+        #     + (v_u2[3] + v_u2[2] * v_u2[4]) * vW_in2
+        #     + np.dot(ny0[1], vW)
+        # )
+        # ny1[2] = (ny1[1] + v_y0[2]) * np.dot(ny0[1], vWout)
+        # ny2[2] = np.dot(v_u1[2], vW_in1)
+        #
+        # ny0[3] = (
+        #     np.dot(v_u1[3], vW_in1)
+        #     + (v_u2[4] + v_u2[3] * v_u2[5]) * vW_in2
+        #     + np.dot(ny0[2], vW)
+        # )
+        #
+        # ny1[3] = (ny1[2] + ny1[0]) * np.dot(ny0[2], vWout)
+        # ny2[3] = np.dot(v_u1[3], vW_in1)
+        #
+        # ny0[4] = (
+        #     np.dot(v_u1[4], vW_in1)
+        #     + (v_u2[5] + v_u2[4] * v_u2[6]) * vW_in2
+        #     + np.dot(ny0[3], vW)
+        # )
+        #
+        # ny1[4] = (ny1[3] + ny1[1]) * np.dot(ny0[3], vWout)
+        # ny2[4] = np.dot(v_u1[4], vW_in1)
 
         # TODO FIXME: What is this testing?  At least assert something.
-
-    def test_grad_two_scans(self):
-
-        # data input & output
-        x = tensor3("x")
-        t = imatrix("t")
-
-        # forward pass
-        W = shared(
-            np.random.default_rng(utt.fetch_seed()).random((2, 2)).astype("float32"),
-            name="W",
-            borrow=True,
-        )
-
-        def forward_scanner(x_t):
-            a2_t = dot(x_t, W)
-            y_t = softmax_graph(a2_t)
-            return y_t
-
-        y, _ = scan(fn=forward_scanner, sequences=x, outputs_info=[None])
-
-        # loss function
-        def error_scanner(y_t, t_t):
-            return mean(categorical_crossentropy(y_t, t_t))
-
-        L, _ = scan(fn=error_scanner, sequences=[y, t], outputs_info=[None])
-        L = mean(L)
-
-        # backward pass
-        grad(L, [W])
+        benchmark(f, v_u1, v_u2, v_x0, v_y0, vW_in1)
 
     def _grad_mout_helper(self, n_iters, mode):
         rng = np.random.default_rng(utt.fetch_seed())
@@ -4148,3 +3967,75 @@ def test_ScanInfo_totals(fn, sequences, outputs_info, non_sequences, n_steps, op
     assert scan_op.info.n_outer_outputs == len(res.owner.outputs)
     assert scan_op.info.n_inner_inputs == len(res.owner.op.inner_inputs)
     assert scan_op.info.n_inner_outputs == len(res.owner.op.inner_outputs)
+
+
+@pytest.mark.parametrize("linker_mode", ["cvm", "py"])
+def test_output_storage_reuse(linker_mode):
+    """Make sure that outer-output storage is correctly initialized when it's non-``None``/empty."""
+
+    if linker_mode == "cvm":
+        # This implicitly confirms that the Cython version is being used
+        from aesara.scan import scan_perform_ext  # noqa: F401
+
+    mode = Mode(linker=linker_mode, optimizer=None)
+
+    def fn(n):
+        """
+        Since the following inner-`Scan` is nested, its outer-output storage
+        will be non-``None`` after the second outer-`Scan` iteration, and all
+        subsequent iterations will use the previous outer-output storage.  Due
+        to the ``n_step`` changes, the shape of the outer-inputs array that's
+        allocated for the lagged/sit-sot ``z`` results should differ from the
+        shape of the previously allocated outer-output array. Since the
+        outer-output arrays are initialized using the outer-input arrays, the
+        shape difference needs to be handled correctly.
+        """
+        s_in_y, _ = scan(
+            fn=lambda z: (z + 1, until(z > 2)),
+            outputs_info=[
+                {"taps": [-1], "initial": at.as_tensor(0.0, dtype=np.float64)}
+            ],
+            mode=mode,
+            n_steps=n - 1,
+            allow_gc=False,
+        )
+
+        return s_in_y.sum()
+
+    s_y, updates = scan(
+        fn=fn,
+        outputs_info=[None],
+        sequences=[at.as_tensor([3, 2, 1], dtype=np.int64)],
+        mode=mode,
+        allow_gc=False,
+    )
+
+    f_cvm = function([], s_y, mode=mode)
+
+    res = f_cvm()
+
+    assert np.array_equal(res, np.array([3, 1, 0]))
+
+
+@pytest.mark.xfail(reason="Need to fix overly strict tensor type checking")
+def test_bad_broadcast_check():
+    inp = np.arange(10).reshape(-1, 1).astype(config.floatX)
+
+    def onestep(x, x_tm4):
+        return x, x_tm4
+
+    # This will have a broadcastable last dimension
+    seq = at.as_tensor(inp)
+
+    # This won't, so it will fail
+    initial_value = shared(np.zeros((4, 1), dtype=config.floatX))
+
+    outputs_info = ([{"initial": initial_value, "taps": [-4]}, None],)
+    results, updates = scan(fn=onestep, sequences=seq, outputs_info=outputs_info)
+
+    exp_out = np.zeros((10, 1)).astype(config.floatX)
+    exp_out[4:] = inp[:-4]
+
+    f = function([], results[1])
+    out = f()
+    assert np.array_equal(exp_out, out)

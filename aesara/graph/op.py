@@ -9,15 +9,13 @@ from typing import (
     Dict,
     List,
     Optional,
+    Protocol,
     Sequence,
-    Text,
     Tuple,
     TypeVar,
     Union,
     cast,
 )
-
-from typing_extensions import Protocol
 
 import aesara
 from aesara.configdefaults import config
@@ -222,21 +220,22 @@ class Op(MetaObject):
         """
         if self.itypes is None:
             raise NotImplementedError(
-                "You can either define itypes and otypes,\
-             or implement make_node"
+                "You can either define itypes and otypes, or implement make_node"
             )
 
         if self.otypes is None:
             raise NotImplementedError(
-                "You can either define itypes and otypes,\
-             or implement make_node"
+                "You can either define itypes and otypes, or implement make_node"
             )
 
         if len(inputs) != len(self.itypes):
             raise ValueError(
                 f"We expected {len(self.itypes)} inputs but got {len(inputs)}."
             )
-        if not all(it.in_same_class(inp.type) for inp, it in zip(inputs, self.itypes)):
+        if not all(
+            expected_type.is_super(var.type)
+            for var, expected_type in zip(inputs, self.itypes)
+        ):
             raise TypeError(
                 f"Invalid input types for Op {self}:\n"
                 + "\n".join(
@@ -319,53 +318,73 @@ class Op(MetaObject):
     add_tag_trace = staticmethod(add_tag_trace)
 
     def grad(
-        self, inputs: List[Variable], output_grads: List[Variable]
+        self, inputs: Sequence[Variable], output_grads: Sequence[Variable]
     ) -> List[Variable]:
-        """Construct a graph for the gradient with respect to each input variable.
+        r"""Construct a graph for the gradient with respect to each input variable.
 
         Each returned `Variable` represents the gradient with respect to that
         input computed based on the symbolic gradients with respect to each
         output. If the output is not differentiable with respect to an input,
-        then this method should return an instance of type ``NullType`` for that
+        then this method should return an instance of type `NullType` for that
         input.
+
+        Using the reverse-mode AD characterization given in [1]_, for a
+        :math:`C = f(A, B)` representing the function implemented by the `Op`
+        and its two arguments :math:`A` and :math:`B`, given by the
+        `Variable`\s in `inputs`, the values returned by `Op.grad` represent
+        the quantities :math:`\bar{A} \equiv \frac{\partial S_O}{A}` and
+        :math:`\bar{B}`, for some scalar output term :math:`S_O` of :math:`C`
+        in
+
+        .. math::
+
+            \operatorname{Tr}\left(\bar{C}^\top dC\right) =
+                \operatorname{Tr}\left(\bar{A}^\top dA\right) +
+                \operatorname{Tr}\left(\bar{B}^\top dB\right)
+
 
         Parameters
         ----------
-        inputs : list of Variable
+        inputs
             The input variables.
-        output_grads : list of Variable
+        output_grads
             The gradients of the output variables.
 
         Returns
         -------
-        grads : list of Variable
+        grads
             The gradients with respect to each `Variable` in `inputs`.
+
+        .. [1] Giles, Mike. 2008. “An Extended Collection of Matrix Derivative Results for Forward and Reverse Mode Automatic Differentiation.”
 
         """
         raise NotImplementedError()
 
     def L_op(
         self,
-        inputs: List[Variable],
-        outputs: List[Variable],
-        output_grads: List[Variable],
+        inputs: Sequence[Variable],
+        outputs: Sequence[Variable],
+        output_grads: Sequence[Variable],
     ) -> List[Variable]:
         r"""Construct a graph for the L-operator.
 
-        This method is primarily used by `Lop` and dispatches to
-        :meth:`Op.grad` by default.
+        The L-operator computes a row vector times the Jacobian.
 
-        The L-operator computes a *row* vector times the Jacobian. The
-        mathematical relationship is
-        :math:`v \frac{\partial f(x)}{\partial x}`.
-        The L-operator is also supported for generic tensors (not only for
-        vectors).
+        This method dispatches to :meth:`Op.grad` by default.  In one sense,
+        this method provides the original outputs when they're needed to
+        compute the return value, whereas `Op.grad` doesn't.
+
+        See `Op.grad` for a mathematical explanation of the inputs and outputs
+        of this method.
 
         Parameters
         ----------
-        inputs : list of Variable
-        outputs : list of Variable
-        output_grads : list of Variable
+        inputs
+            The inputs of the `Apply` node using this `Op`.
+        outputs
+            The outputs of the `Apply` node using this `Op`
+        output_grads
+            The gradients with respect to each `Variable` in `inputs`.
 
         """
         return self.grad(inputs, output_grads)
@@ -376,8 +395,6 @@ class Op(MetaObject):
         r"""Construct a graph for the R-operator.
 
         This method is primarily used by `Rop`.
-
-        Suppose the `Op` outputs ``[ f_1(inputs), ..., f_n(inputs) ]``.
 
         Parameters
         ----------
@@ -399,7 +416,7 @@ class Op(MetaObject):
     def perform(
         self,
         node: Apply,
-        inputs: List[Variable],
+        inputs: Sequence[Any],
         output_storage: OutputStorageType,
         params: ParamsInputType = None,
     ) -> None:
@@ -477,7 +494,7 @@ class Op(MetaObject):
         node: Apply,
         storage_map: Optional[StorageMapType],
         compute_map: Optional[ComputeMapType],
-        impl: Optional[Text],
+        impl: Optional[str],
     ) -> None:
         """Make any special modifications that the `Op` needs before doing :meth:`Op.make_thunk`.
 
@@ -509,7 +526,7 @@ class Op(MetaObject):
         node_output_storage = [storage_map[r] for r in node.outputs]
 
         if debug and hasattr(self, "debug_perform"):
-            p = node.op.debug_perform  # type: ignore
+            p = node.op.debug_perform
         else:
             p = node.op.perform
 
@@ -554,7 +571,7 @@ class Op(MetaObject):
         storage_map: StorageMapType,
         compute_map: ComputeMapType,
         no_recycling: List[Variable],
-        impl: Optional[Text] = None,
+        impl: Optional[str] = None,
     ) -> ThunkType:
         r"""Create a thunk.
 
@@ -657,7 +674,7 @@ def get_test_value(v: Any) -> Any:
     return v.get_test_value()
 
 
-def missing_test_message(msg: Text) -> None:
+def missing_test_message(msg: str) -> None:
     """Display a message saying that some test_value is missing.
 
     This uses the appropriate form based on ``config.compute_test_value``:

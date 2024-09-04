@@ -1,3 +1,4 @@
+import contextlib
 import os
 import sys
 import time
@@ -198,10 +199,10 @@ def check_basics(
     avg_var = 0.0
 
     for i in range(steps):
-        t0 = time.time()
+        t0 = time.perf_counter()
         ival = f(*inputs)
         assert ival.shape == sample_size
-        dt += time.time() - t0
+        dt += time.perf_counter() - t0
         ival = np.asarray(ival)
         if i == 0:
             mean = np.array(ival, copy=True)
@@ -277,7 +278,6 @@ def test_uniform():
         # test empty size (scalar)
         ((), (), [], []),
     ]:
-
         # TEST CPU IMPLEMENTATION
         # The python and C implementation are tested with DebugMode
         x = matrix()
@@ -332,12 +332,20 @@ def test_broadcastable():
         # the sizes of them are implicitly defined with "pvals" argument.
         if distribution in [R.multinomial, R.multinomial_wo_replacement]:
             # check when all dimensions are constant
-            uu = distribution(pvals=pvals_1)
-            assert uu.broadcastable == (False, True)
+            context_mgr = (
+                pytest.deprecated_call()
+                if distribution == R.multinomial_wo_replacement
+                else contextlib.suppress()
+            )
+
+            with context_mgr:
+                uu = distribution(pvals=pvals_1)
+                assert uu.broadcastable == (False, True)
 
             # check when some dimensions are aesara variables
-            uu = distribution(pvals=pvals_2)
-            assert uu.broadcastable == (False, True)
+            with context_mgr:
+                uu = distribution(pvals=pvals_2)
+                assert uu.broadcastable == (False, True)
         else:
             # check when all dimensions are constant
             uu = distribution(size=size1)
@@ -719,16 +727,15 @@ def test_truncated_normal():
 def basic_multinomialtest(
     f, steps, sample_size, target_pvals, n_samples, prefix="", mean_rtol=0.04
 ):
-
     dt = 0.0
     avg_pvals = np.zeros(target_pvals.shape, dtype=config.floatX)
 
     for i in range(steps):
-        t0 = time.time()
+        t0 = time.perf_counter()
         ival = f()
         assert ival.shape == sample_size
         assert np.all(np.sum(ival, axis=1) == n_samples)
-        dt += time.time() - t0
+        dt += time.perf_counter() - t0
         avg_pvals += ival
     avg_pvals /= steps * n_samples
 
@@ -790,7 +797,6 @@ def test_multinomial_n_samples():
 
 class TestMRG:
     def test_bad_size(self):
-
         R = MRG_RandomStream(234)
 
         for size in [
@@ -798,7 +804,6 @@ class TestMRG:
             (-1, 100),
             (1, 0),
         ]:
-
             with pytest.raises(ValueError):
                 R.uniform(size)
             with pytest.raises(ValueError):
@@ -837,7 +842,7 @@ def test_random_state_transfer():
     f2 = function([], g2.y)
 
     g2.rng.rstate = g1.rng.rstate
-    for (su1, su2) in zip(g1.rng.state_updates, g2.rng.state_updates):
+    for su1, su2 in zip(g1.rng.state_updates, g2.rng.state_updates):
         su2[0].set_value(su1[0].get_value())
 
     np.testing.assert_array_almost_equal(f1(), f2(), decimal=6)
@@ -1109,9 +1114,10 @@ def test_target_parameter():
     basic_target_parameter_test(
         srng.choice(p=pvals.astype("float32"), replace=False, target="cpu")
     )
-    basic_target_parameter_test(
-        srng.multinomial_wo_replacement(pvals=pvals.astype("float32"), target="cpu")
-    )
+    with pytest.deprecated_call():
+        basic_target_parameter_test(
+            srng.multinomial_wo_replacement(pvals=pvals.astype("float32"), target="cpu")
+        )
 
 
 @config.change_flags(compute_test_value="off")

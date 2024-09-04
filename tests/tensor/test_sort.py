@@ -44,7 +44,7 @@ class TestSort:
     def setup_method(self):
         self.rng = np.random.default_rng(seed=utt.fetch_seed())
         self.m_val = self.rng.random((3, 2))
-        self.v_val = self.rng.random((4))
+        self.v_val = self.rng.random(4)
 
     def test1(self):
         a = dmatrix()
@@ -98,11 +98,11 @@ class TestSort:
         utt.assert_allclose(gv, gt)
 
     def test_grad_vector(self):
-        data = self.rng.random((10)).astype(aesara.config.floatX)
+        data = self.rng.random(10).astype(aesara.config.floatX)
         utt.verify_grad(sort, [data])
 
     def test_grad_none_axis(self):
-        data = self.rng.random((10)).astype(aesara.config.floatX)
+        data = self.rng.random(10).astype(aesara.config.floatX)
         utt.verify_grad(lambda x: sort(x, None), [data])
         utt.verify_grad(lambda x: sort(x, 0), [data])
 
@@ -185,7 +185,7 @@ def test_argsort():
     # Set up
     rng = np.random.default_rng(seed=utt.fetch_seed())
     m_val = rng.random((3, 2))
-    v_val = rng.random((4))
+    v_val = rng.random(4)
 
     # Example 1
     a = dmatrix()
@@ -459,7 +459,7 @@ class TestTopK:
             if k == 0:
                 continue
 
-            x = tensor(name="x", shape=(False,) * len(shp), dtype=dtype)
+            x = tensor(name="x", shape=(None,) * len(shp), dtype=dtype)
             y = argtopk(x, k, axis=axis, sorted=sorted, idx_dtype=idx_dtype)
             fn = aesara.function([x], y, mode=self.mode)
             assert any(
@@ -515,7 +515,7 @@ class TestTopKInferShape(utt.InferShapeTester):
             if k == 0:
                 continue
 
-            x = tensor(name="x", shape=(False,) * len(shp), dtype=aesara.config.floatX)
+            x = tensor(name="x", shape=(None,) * len(shp), dtype=aesara.config.floatX)
             yv, yi = topk_and_argtopk(x, k, axis=axis, sorted=False, idx_dtype="int32")
             size = reduce(int.__mul__, shp)
             xval = gen_unique_vector(size, aesara.config.floatX).reshape(shp)

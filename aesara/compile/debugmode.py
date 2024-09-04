@@ -31,7 +31,7 @@ from aesara.compile.ops import OutputGuard, _output_guard
 from aesara.configdefaults import config
 from aesara.graph.basic import Variable, io_toposort
 from aesara.graph.destroyhandler import DestroyHandler
-from aesara.graph.features import AlreadyThere, BadOptimization
+from aesara.graph.features import AlreadyThere, BadOptimization, Feature
 from aesara.graph.op import HasInnerGraph, Op
 from aesara.graph.utils import InconsistencyError, MethodNotDefined
 from aesara.link.basic import Container, LocalLinker
@@ -437,7 +437,7 @@ def _optcheck_fgraph(input_specs, output_specs, accept_inplace=False):
         input_specs, output_specs, accept_inplace, force_clone=True
     )
     fgraph.attach_feature(equivalence_tracker)
-    return fgraph, updates, equivalence_tracker
+    return fgraph, updates
 
 
 class DataDestroyed:
@@ -567,7 +567,6 @@ def _check_viewmap(fgraph, node, storage_map):
     """
 
     for oi, onode in enumerate(node.outputs):
-
         good_alias, bad_alias = {}, {}
         outstorage = storage_map[onode][0]
 
@@ -590,13 +589,11 @@ def _check_viewmap(fgraph, node, storage_map):
             if hasattr(inode.type, "may_share_memory") and inode.type.may_share_memory(
                 outstorage, in_storage
             ):
-
                 nodeid = id(inode)
                 bad_alias[nodeid] = ii
 
                 # check that the aliasing was declared in [view|destroy]_map
                 if [ii] == view_map.get(oi, None) or [ii] == destroy_map.get(oi, None):
-
                     good_alias[nodeid] = bad_alias.pop(nodeid)
 
         # TODO: make sure this is correct
@@ -807,7 +804,7 @@ def _get_preallocated_maps(
         for r in considered_outputs:
             if isinstance(r.type, TensorType):
                 # Build a C-contiguous buffer
-                new_buf = r.type.value_zeros(r_vals[r].shape)
+                new_buf = np.empty(r_vals[r].shape, dtype=r.type.dtype)
                 assert new_buf.flags["C_CONTIGUOUS"]
                 new_buf[...] = np.asarray(def_val).astype(r.type.dtype)
 
@@ -848,17 +845,17 @@ def _get_preallocated_maps(
         or "ALL" in prealloc_modes
     ):
         max_ndim = 0
-        rev_out_broadcastable = []
+        rev_out_shape = []
         for r in considered_outputs:
             if isinstance(r.type, TensorType):
                 if max_ndim < r.ndim:
-                    rev_out_broadcastable += [True] * (r.ndim - max_ndim)
+                    rev_out_shape += [1] * (r.ndim - max_ndim)
                     max_ndim = r.ndim
-                assert len(rev_out_broadcastable) == max_ndim
+                assert len(rev_out_shape) == max_ndim
 
-                for i, b in enumerate(r.broadcastable[::-1]):
-                    rev_out_broadcastable[i] = rev_out_broadcastable[i] and b
-        out_broadcastable = rev_out_broadcastable[::-1]
+                for i, s in enumerate(r.type.shape[::-1]):
+                    rev_out_shape[i] = 1 if rev_out_shape[i] == 1 and s == 1 else None
+        out_shape = rev_out_shape[::-1]
 
     if "strided" in prealloc_modes or "ALL" in prealloc_modes:
         check_ndim = config.DebugMode__check_preallocated_output_ndim
@@ -875,7 +872,8 @@ def _get_preallocated_maps(
                         buf_shape.append(s)
                     else:
                         buf_shape.append(s * 2)
-                new_buf = r.type.value_zeros(buf_shape)
+
+                new_buf = np.empty(buf_shape, dtype=r.type.dtype)
                 new_buf[...] = np.asarray(def_val).astype(r.type.dtype)
                 init_strided[r] = new_buf
 
@@ -886,14 +884,14 @@ def _get_preallocated_maps(
         # Moreover, to avoid memory problems, we do not test with strides
         # 2 and -2 on those dimensions.
         step_signs_list = []
-        for b in out_broadcastable[-check_ndim:]:
-            if b:
+        for s in out_shape[-check_ndim:]:
+            if s == 1:
                 step_signs_list.append((1,))
             else:
                 step_signs_list.append((-1, 1))
 
         # Use the same step on all dimensions before the last check_ndim.
-        if all(out_broadcastable[:-check_ndim]):
+        if all(s == 1 for s in out_shape[:-check_ndim]):
             step_signs_list = [(1,)] + step_signs_list
         else:
             step_signs_list = [(-1, 1)] + step_signs_list
@@ -904,7 +902,7 @@ def _get_preallocated_maps(
 
                 # First, the dimensions above check_ndim, then the other ones
                 # Do not test with 2 or -2 for dimensions above check_ndim
-                steps = [step_signs[0]] * len(out_broadcastable[:-check_ndim])
+                steps = [step_signs[0]] * len(out_shape[:-check_ndim])
                 steps += [s * step_size for s in step_signs[1:]]
 
                 name = f"strided{tuple(steps)}"
@@ -931,8 +929,8 @@ def _get_preallocated_maps(
 
     if "wrong_size" in prealloc_modes or "ALL" in prealloc_modes:
         # For each dimension, try size-1, size, size+1
-        for dim, b in enumerate(out_broadcastable):
-            if b:
+        for dim, s in enumerate(out_shape):
+            if s == 1:
                 # The shape has to be 1
                 continue
 
@@ -946,11 +944,11 @@ def _get_preallocated_maps(
                 for r in considered_outputs:
                     if isinstance(r.type, TensorType):
                         r_shape_diff = shape_diff[: r.ndim]
-                        out_shape = [
+                        new_buf_shape = [
                             max((s + sd), 0)
                             for s, sd in zip(r_vals[r].shape, r_shape_diff)
                         ]
-                        new_buf = r.type.value_zeros(out_shape)
+                        new_buf = np.empty(new_buf_shape, dtype=r.type.dtype)
                         new_buf[...] = np.asarray(def_val).astype(r.type.dtype)
                         wrong_size[r] = new_buf
 
@@ -1009,7 +1007,7 @@ def _check_preallocated_output(
                 aliased_inputs.add(r)
 
         _logger.debug("starting preallocated output checking")
-        for (name, out_map) in _get_preallocated_maps(
+        for name, out_map in _get_preallocated_maps(
             node,
             thunk,
             prealloc_modes,
@@ -1171,98 +1169,83 @@ class _FunctionGraphEvent:
         return not (self == other)
 
 
-class _VariableEquivalenceTracker:
+class _VariableEquivalenceTracker(Feature):
     """
     A FunctionGraph Feature that keeps tabs on an FunctionGraph and
     tries to detect problems.
 
     """
 
-    fgraph = None
-    """WRITEME"""
-
-    equiv = None
-    """WRITEME"""
-
-    active_nodes = None
-    """WRITEME"""
-
-    inactive_nodes = None
-    """WRITEME"""
-
-    all_variables_ever = None
-    """WRITEME"""
-
-    reasons = None
-    """WRITEME"""
-
-    replaced_by = None
-    """WRITEME"""
-
-    event_list = None
-    """WRITEME"""
-
-    def __init__(self):
-        self.fgraph = None
-
     def on_attach(self, fgraph):
-        if self.fgraph is not None:
+        if hasattr(fgraph, "_eq_tracker_equiv"):
             raise AlreadyThere()
 
-        self.equiv = {}
-        self.active_nodes = set()
-        self.inactive_nodes = set()
-        self.fgraph = fgraph
-        self.all_variables_ever = []
-        self.reasons = {}
-        self.replaced_by = {}
-        self.event_list = []
+        fgraph._eq_tracker_equiv = {}
+        fgraph._eq_tracker_active_nodes = set()
+        fgraph._eq_tracker_inactive_nodes = set()
+        fgraph._eq_tracker_fgraph = fgraph
+        fgraph._eq_tracker_all_variables_ever = []
+        fgraph._eq_tracker_reasons = {}
+        fgraph._eq_tracker_replaced_by = {}
+        fgraph._eq_tracker_event_list = []
+
         for node in fgraph.toposort():
-            self.on_import(fgraph, node, "on_attach")
+            self.on_import(fgraph, node, "var_equiv_on_attach")
 
     def on_detach(self, fgraph):
-        assert fgraph is self.fgraph
         self.fgraph = None
+        del fgraph._eq_tracker_equiv
+        del fgraph._eq_tracker_active_nodes
+        del fgraph._eq_tracker_inactive_nodes
+        del fgraph._eq_tracker_fgraph
+        del fgraph._eq_tracker_all_variables_ever
+        del fgraph._eq_tracker_reasons
+        del fgraph._eq_tracker_replaced_by
+        del fgraph._eq_tracker_event_list
 
     def on_prune(self, fgraph, node, reason):
-        self.event_list.append(_FunctionGraphEvent("prune", node, reason=str(reason)))
-        assert node in self.active_nodes
-        assert node not in self.inactive_nodes
-        self.active_nodes.remove(node)
-        self.inactive_nodes.add(node)
+        fgraph._eq_tracker_event_list.append(
+            _FunctionGraphEvent("prune", node, reason=str(reason))
+        )
+        assert node in fgraph._eq_tracker_active_nodes
+        assert node not in fgraph._eq_tracker_inactive_nodes
+        fgraph._eq_tracker_active_nodes.remove(node)
+        fgraph._eq_tracker_inactive_nodes.add(node)
 
     def on_import(self, fgraph, node, reason):
-        self.event_list.append(_FunctionGraphEvent("import", node, reason=str(reason)))
+        fgraph._eq_tracker_event_list.append(
+            _FunctionGraphEvent("import", node, reason=str(reason))
+        )
 
-        assert node not in self.active_nodes
-        self.active_nodes.add(node)
+        assert node not in fgraph._eq_tracker_active_nodes
+        fgraph._eq_tracker_active_nodes.add(node)
 
-        if node in self.inactive_nodes:
-            self.inactive_nodes.remove(node)
+        if node in fgraph._eq_tracker_inactive_nodes:
+            fgraph._eq_tracker_inactive_nodes.remove(node)
             for r in node.outputs:
-                assert r in self.equiv
+                assert r in fgraph._eq_tracker_equiv
         else:
             for r in node.outputs:
-                assert r not in self.equiv
-                self.equiv[r] = {r}
-                self.all_variables_ever.append(r)
-                self.reasons.setdefault(r, [])
-                self.replaced_by.setdefault(r, [])
+                assert r not in fgraph._eq_tracker_equiv
+                fgraph._eq_tracker_equiv[r] = {r}
+                fgraph._eq_tracker_all_variables_ever.append(r)
+                fgraph._eq_tracker_reasons.setdefault(r, [])
+                fgraph._eq_tracker_replaced_by.setdefault(r, [])
             for r in node.inputs:
-                self.reasons.setdefault(r, [])
-                self.replaced_by.setdefault(r, [])
+                fgraph._eq_tracker_reasons.setdefault(r, [])
+                fgraph._eq_tracker_replaced_by.setdefault(r, [])
 
     def on_change_input(self, fgraph, node, i, r, new_r, reason=None):
         reason = str(reason)
-        self.event_list.append(
+        fgraph._eq_tracker_event_list.append(
             _FunctionGraphEvent("change", node, reason=reason, idx=i)
         )
 
-        self.reasons.setdefault(new_r, [])
-        self.replaced_by.setdefault(new_r, [])
+        fgraph._eq_tracker_reasons.setdefault(new_r, [])
+        fgraph._eq_tracker_replaced_by.setdefault(new_r, [])
 
         append_reason = True
-        for tup in self.reasons[new_r]:
+        for tup in fgraph._eq_tracker_reasons[new_r]:
             if tup[0] == reason and tup[1] is r:
                 append_reason = False
 
@@ -1271,7 +1254,7 @@ class _VariableEquivalenceTracker:
             # optimizations will change the graph
             done = dict()
             used_ids = dict()
-            self.reasons[new_r].append(
+            fgraph._eq_tracker_reasons[new_r].append(
                 (
                     reason,
                     r,
@@ -1295,19 +1278,19 @@ class _VariableEquivalenceTracker:
                     ).getvalue(),
                 )
             )
-            self.replaced_by[r].append((reason, new_r))
+            fgraph._eq_tracker_replaced_by[r].append((reason, new_r))
 
-        if r in self.equiv:
-            r_set = self.equiv[r]
+        if r in fgraph._eq_tracker_equiv:
+            r_set = fgraph._eq_tracker_equiv[r]
         else:
-            r_set = self.equiv.setdefault(r, {r})
-            self.all_variables_ever.append(r)
+            r_set = fgraph._eq_tracker_equiv.setdefault(r, {r})
+            fgraph._eq_tracker_all_variables_ever.append(r)
 
-        if new_r in self.equiv:
-            new_r_set = self.equiv[new_r]
+        if new_r in fgraph._eq_tracker_equiv:
+            new_r_set = fgraph._eq_tracker_equiv[new_r]
         else:
-            new_r_set = self.equiv.setdefault(new_r, {new_r})
-            self.all_variables_ever.append(new_r)
+            new_r_set = fgraph._eq_tracker_equiv.setdefault(new_r, {new_r})
+            fgraph._eq_tracker_all_variables_ever.append(new_r)
 
         assert new_r in new_r_set
         assert r in r_set
@@ -1316,17 +1299,11 @@ class _VariableEquivalenceTracker:
         # transfer all the elements of the old one to the new one
         r_set.update(new_r_set)
         for like_new_r in new_r_set:
-            self.equiv[like_new_r] = r_set
+            fgraph._eq_tracker_equiv[like_new_r] = r_set
             assert like_new_r in r_set
 
-        assert self.equiv[r] is r_set
-        assert self.equiv[new_r] is r_set
-
-    def printstuff(self):
-        for key in self.equiv:
-            print(key)
-            for e in self.equiv[key]:
-                print("  ", e)
+        assert fgraph._eq_tracker_equiv[r] is r_set
+        assert fgraph._eq_tracker_equiv[new_r] is r_set
 
 
 # List of default version of make thunk.
@@ -1381,9 +1358,7 @@ class _Linker(LocalLinker):
         # Compute a topological ordering that IGNORES the destroy_map
         # of destructive Ops.  This will be OK, because every thunk is
         # evaluated on a copy of its input.
-        fgraph_equiv = fgraph.equivalence_tracker
-        order_outputs = copy.copy(fgraph_equiv.all_variables_ever)
-        del fgraph_equiv
+        order_outputs = copy.copy(fgraph._eq_tracker_all_variables_ever)
         order_outputs.reverse()
         order = io_toposort(fgraph.inputs, order_outputs)
 
@@ -1617,7 +1592,7 @@ class _Linker(LocalLinker):
                             # insert a given apply node. If that is not True,
                             # we would need to loop over all node outputs,
                             # But this make the output uglier.
-                            reason = fgraph.equivalence_tracker.reasons[node.outputs[0]]
+                            reason = fgraph._eq_tracker_reasons[node.outputs[0]]
                             if not reason:
                                 raise
                             opt = str(reason[0][0])
@@ -1696,7 +1671,6 @@ class _Linker(LocalLinker):
                         sys.stdout.flush()
 
                     if thunk_c:
-
                         clobber = True
                         if thunk_py:
                             dmap = node.op.destroy_map
@@ -1730,7 +1704,7 @@ class _Linker(LocalLinker):
                             # insert a given apply node. If that is not True,
                             # we would need to loop over all node outputs,
                             # But this make the output uglier.
-                            reason = fgraph.equivalence_tracker.reasons[node.outputs[0]]
+                            reason = fgraph._eq_tracker_reasons[node.outputs[0]]
                             if not reason:
                                 raise
                             opt = str(reason[0][0])
@@ -1857,9 +1831,7 @@ class _Linker(LocalLinker):
                     # But it is very slow and it is not sure it will help.
                     gc.collect()
 
-                _find_bad_optimizations(
-                    order, fgraph.equivalence_tracker.reasons, r_vals
-                )
+                _find_bad_optimizations(order, fgraph._eq_tracker_reasons, r_vals)
 
                 #####
                 #  Postcondition: the input and output variables are
@@ -2041,10 +2013,9 @@ class _Maker(FunctionMaker):  # inheritance buys a few helper functions
 
         # make the fgraph
         for i in range(mode.stability_patience):
-            fgraph, additional_outputs, equivalence_tracker = _optcheck_fgraph(
+            fgraph, additional_outputs = _optcheck_fgraph(
                 inputs, outputs, accept_inplace
             )
-            fgraph.equivalence_tracker = equivalence_tracker
 
             with config.change_flags(compute_test_value=config.compute_test_value_opt):
                 optimizer(fgraph)
@@ -2056,8 +2027,8 @@ class _Maker(FunctionMaker):  # inheritance buys a few helper functions
             if i == 0:
                 fgraph0 = fgraph
             else:
-                li = fgraph.equivalence_tracker.event_list
-                l0 = fgraph0.equivalence_tracker.event_list
+                li = fgraph._eq_tracker_event_list
+                l0 = fgraph0._eq_tracker_event_list
                 if li != l0:
                     infolog = StringIO()
                     print("Optimization process is unstable...", file=infolog)

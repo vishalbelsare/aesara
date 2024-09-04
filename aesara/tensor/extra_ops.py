@@ -1,18 +1,20 @@
 from collections.abc import Collection
-from typing import Iterable, Tuple, Union
+from functools import reduce
+from typing import Iterable, Set, Tuple, Union
 
 import numpy as np
 import numpy.core.numeric
 from numpy.core.multiarray import normalize_axis_index
 
 import aesara
+import aesara.scalar.basic as aes
 from aesara.gradient import (
     DisconnectedType,
     _float_zeros_like,
     disconnected_type,
     grad_undefined,
 )
-from aesara.graph.basic import Apply, Variable, equal_computations
+from aesara.graph.basic import Apply, Constant, Variable, equal_computations
 from aesara.graph.op import Op
 from aesara.link.c.op import COp
 from aesara.link.c.params_type import ParamsType
@@ -21,14 +23,13 @@ from aesara.misc.safe_asarray import _asarray
 from aesara.raise_op import Assert
 from aesara.scalar import int32 as int_t
 from aesara.scalar import upcast
+from aesara.scalar.basic import Composite
 from aesara.tensor import basic as at
 from aesara.tensor import get_vector_length
 from aesara.tensor.exceptions import NotScalarConstantError
 from aesara.tensor.math import abs as at_abs
 from aesara.tensor.math import all as at_all
-from aesara.tensor.math import eq, ge, lt
-from aesara.tensor.math import max as at_max
-from aesara.tensor.math import maximum, minimum, or_, prod
+from aesara.tensor.math import ge, lt, maximum, minimum, prod
 from aesara.tensor.math import sum as at_sum
 from aesara.tensor.subtensor import advanced_inc_subtensor1, set_subtensor
 from aesara.tensor.type import TensorType, dvector, int_dtypes, integer_dtypes, vector
@@ -667,19 +668,21 @@ class Repeat(Op):
             )
 
         if self.axis is None:
-            broadcastable = [False]
+            out_shape = [None]
         else:
             try:
                 const_reps = at.get_scalar_constant_value(repeats)
             except NotScalarConstantError:
                 const_reps = None
             if const_reps == 1:
-                broadcastable = x.broadcastable
+                out_shape = x.type.shape
             else:
-                broadcastable = list(x.broadcastable)
-                broadcastable[self.axis] = False
+                out_shape = list(x.type.shape)
+                out_shape[self.axis] = None
 
-        out_type = TensorType(x.dtype, broadcastable)
+        out_type = TensorType(
+            x.dtype, shape=tuple(1 if s == 1 else None for s in out_shape)
+        )
 
         return Apply(self, [x, repeats], [out_type()])
 
@@ -690,7 +693,6 @@ class Repeat(Op):
         z[0] = np.repeat(x, repeats=repeats, axis=self.axis)
 
     def connection_pattern(self, node):
-
         return [[True], [False]]
 
     def grad(self, inputs, gout):
@@ -1177,33 +1179,26 @@ class Unique(Op):
         self.return_inverse = return_inverse
         self.return_counts = return_counts
         self.axis = axis
-        numpy_ver = [int(n) for n in np.__version__.split(".")[:2]]
-        if self.axis is not None and bool(numpy_ver < [1, 13]):
-            raise RuntimeError(
-                "Numpy version = "
-                + np.__version__
-                + f". Option 'axis={axis}' works starting from version 1.13.0."
-            )
 
     def make_node(self, x):
         x = at.as_tensor_variable(x)
         self_axis = self.axis
         if self_axis is None:
-            broadcastable = [False]
+            out_shape = (None,)
         else:
             if self_axis < 0:
-                self_axis += len(x.broadcastable)
-            if self_axis < 0 or self_axis >= len(x.broadcastable):
-                raise RuntimeError(
-                    "Unique axis `{}` is outside of input ndim = "
-                    "{}.".format(self.axis, len(x.broadcastable))
+                self_axis += x.type.ndim
+            if self_axis < 0 or self_axis >= x.type.ndim:
+                raise ValueError(
+                    f"Unique axis {self.axis} is outside of input ndim = {x.type.ndim}"
                 )
-            broadcastable = [
-                b if axis != self_axis else False
-                for axis, b in enumerate(x.broadcastable)
-            ]
-        outputs = [TensorType(shape=broadcastable, dtype=x.dtype)()]
-        typ = TensorType(shape=[False], dtype="int64")
+            out_shape = tuple(
+                s if s == 1 and axis != self_axis else None
+                for axis, s in enumerate(x.type.shape)
+            )
+
+        outputs = [TensorType(dtype=x.dtype, shape=out_shape)()]
+        typ = TensorType(dtype="int64", shape=(None,))
         if self.return_index:
             outputs.append(typ())
         if self.return_inverse:
@@ -1309,7 +1304,7 @@ class UnravelIndex(Op):
             self,
             [indices, dims],
             [
-                TensorType(dtype="int64", shape=(False,) * indices.ndim)()
+                TensorType(dtype="int64", shape=(None,) * indices.type.ndim)()
                 for i in range(at.get_vector_length(dims))
             ],
         )
@@ -1388,7 +1383,7 @@ class RavelMultiIndex(Op):
         return Apply(
             self,
             multi_index + [dims],
-            [TensorType(dtype="int64", shape=(False,) * multi_index[0].ndim)()],
+            [TensorType(dtype="int64", shape=(None,) * multi_index[0].type.ndim)()],
         )
 
     def infer_shape(self, fgraph, node, input_shapes):
@@ -1441,7 +1436,7 @@ def ravel_multi_index(multi_index, dims, mode="raise", order="C"):
     return RavelMultiIndex(mode=mode, order=order)(*args)
 
 
-def broadcast_shape(*arrays, **kwargs):
+def broadcast_shape(*arrays, **kwargs) -> Tuple[aes.ScalarVariable, ...]:
     """Compute the shape resulting from broadcasting arrays.
 
     Parameters
@@ -1462,7 +1457,7 @@ def broadcast_shape(*arrays, **kwargs):
 def broadcast_shape_iter(
     arrays: Iterable[Union[TensorVariable, Tuple[TensorVariable, ...]]],
     arrays_are_shapes: bool = False,
-):
+) -> Tuple[aes.ScalarVariable, ...]:
     r"""Compute the shape resulting from broadcasting arrays.
 
 
@@ -1491,7 +1486,12 @@ def broadcast_shape_iter(
 
         array_shapes = [
             (one_at,) * (max_dims - len(a))
-            + tuple(one_at if getattr(sh, "value", sh) == 1 else sh for sh in a)
+            + tuple(
+                one_at
+                if sh == 1 or isinstance(sh, Constant) and sh.value == 1
+                else (aes.as_scalar(sh) if not isinstance(sh, Variable) else sh)
+                for sh in a
+            )
             for a in arrays
         ]
     else:
@@ -1523,34 +1523,114 @@ def broadcast_shape_iter(
         else:
             # More than one shape might not be broadcastable in this dimension
 
-            all_dims_equal = all(
-                # TODO FIXME: This is a largely deficient means of comparing graphs
-                # (and especially shapes)
-                equal_computations([maybe_non_bcast_shapes[0]], [dim])
-                for dim in maybe_non_bcast_shapes[1:]
-            )
+            nonconst_nb_shapes: Set[int] = set()
+            const_nb_shapes: Set[Variable] = set()
+            for shape in maybe_non_bcast_shapes:
+                if isinstance(shape, Constant):
+                    const_nb_shapes.add(shape.value.item())
+                else:
+                    nonconst_nb_shapes.add(shape)
 
-            if all_dims_equal:
-                result_dims.append(maybe_non_bcast_shapes[0])
-                continue
+            if len(const_nb_shapes) > 1:
+                raise ValueError("Could not broadcast dimensions")
+            elif len(const_nb_shapes) == 1:
+                (const_nb_shape,) = const_nb_shapes
 
-            non_bcast_vec = at.as_tensor(maybe_non_bcast_shapes)
-            non_bcast_vec = at.switch(eq(non_bcast_vec, 1), -one_at, non_bcast_vec)
-            dim_max = at_abs(at_max(non_bcast_vec))
+                assert const_nb_shape != 1
 
-            assert_dim = Assert("Could not broadcast dimensions")
-            assert_cond = at_all(
-                or_(eq(non_bcast_vec, -one_at), eq(non_bcast_vec, dim_max))
-            )
-            bcast_dim = assert_dim(dim_max, assert_cond)
+                const_nt_shape_var = aesara.scalar.ScalarConstant(
+                    aesara.scalar.int64, const_nb_shape
+                )
+
+                if len(nonconst_nb_shapes) > 0:
+                    # All the potential non-broadcast shapes need to either
+                    # be broadcastable or equal to the one non-broadcastable
+                    # constant `const_nt_shape_var`.
+                    assert_dim = Assert("Could not broadcast dimensions")
+
+                    scalar_nonconst_nb_shapes = [
+                        at.scalar_from_tensor(s)
+                        if isinstance(s.type, TensorType)
+                        else s
+                        for s in nonconst_nb_shapes
+                    ]
+
+                    dummy_nonconst_nb_shapes = [
+                        aes.get_scalar_type(dtype=v.dtype)()
+                        for v in scalar_nonconst_nb_shapes
+                    ]
+                    assert_cond = reduce(
+                        aes.and_,
+                        (
+                            aes.or_(
+                                aes.eq(nbv, one_at), aes.eq(nbv, const_nt_shape_var)
+                            )
+                            for nbv in dummy_nonconst_nb_shapes
+                        ),
+                    )
+                    assert_cond_op = Composite(dummy_nonconst_nb_shapes, [assert_cond])
+
+                    bcast_dim = assert_dim(
+                        const_nt_shape_var, assert_cond_op(*scalar_nonconst_nb_shapes)
+                    )
+                else:
+                    bcast_dim = const_nt_shape_var
+            else:
+                # There are no constant, non-broadcastable shapes in this
+                # dimension.
+
+                all_dims_equal = all(
+                    # TODO FIXME: This is a largely deficient, and expensive, means
+                    # of comparing graphs (and especially shapes)
+                    equal_computations([maybe_non_bcast_shapes[0]], [dim])
+                    for dim in maybe_non_bcast_shapes[1:]
+                )
+
+                if all_dims_equal:
+                    result_dims.append(maybe_non_bcast_shapes[0])
+                    continue
+
+                scalar_maybe_non_bcast_shapes = [
+                    at.scalar_from_tensor(s) if isinstance(s.type, TensorType) else s
+                    for s in maybe_non_bcast_shapes
+                ]
+                dummy_maybe_non_bcast_shapes = [
+                    aes.get_scalar_type(dtype=v.dtype)()
+                    for v in scalar_maybe_non_bcast_shapes
+                ]
+                non_bcast_vec = [
+                    aes.switch(aes.eq(nbv, 1), -one_at, nbv)
+                    for nbv in dummy_maybe_non_bcast_shapes
+                ]
+                dim_max = aes.abs(reduce(aes.scalar_maximum, non_bcast_vec))
+                dim_max_op = Composite(dummy_maybe_non_bcast_shapes, [dim_max])
+
+                dummy_dim_max = dim_max_op(*dummy_maybe_non_bcast_shapes)
+
+                assert_dim = Assert("Could not broadcast dimensions")
+                assert_cond = reduce(
+                    aes.and_,
+                    (
+                        aes.or_(aes.eq(nbv, -one_at), aes.eq(nbv, dummy_dim_max))
+                        for nbv in non_bcast_vec
+                    ),
+                )
+                assert_cond_op = Composite(dummy_maybe_non_bcast_shapes, [assert_cond])
+
+                bcast_dim = assert_dim(
+                    dim_max_op(*scalar_maybe_non_bcast_shapes),
+                    assert_cond_op(*scalar_maybe_non_bcast_shapes),
+                )
 
             result_dims.append(bcast_dim)
 
     return tuple(result_dims)
 
 
-class BroadcastTo(Op):
+class BroadcastTo(COp):
     """An `Op` for `numpy.broadcast_to`."""
+
+    __props__ = ()
 
     view_map = {0: [0]}
 
@@ -1560,9 +1640,9 @@ class BroadcastTo(Op):
     def make_node(self, a, *shape):
         a = at.as_tensor_variable(a)
 
-        shape, bcast = at.infer_broadcastable(shape)
+        shape, static_shape = at.infer_static_shape(shape)
 
-        out = TensorType(dtype=a.type.dtype, shape=bcast)()
+        out = TensorType(dtype=a.type.dtype, shape=static_shape)()
 
         # Attempt to prevent in-place operations on this view-based output
         out.tag.indestructible = True
@@ -1584,11 +1664,14 @@ class BroadcastTo(Op):
         d_wrt_a = broadcast_to(dout, shape).sum(axis=new_dims)
 
         # Determine the dimensions that were broadcast
-        _, shape_bcast = at.infer_broadcastable(shape)
+        _, static_shape = at.infer_static_shape(shape)
+
+        # TODO: This needs to be performed at run-time when static shape
+        # information isn't available.
         bcast_sums = [
             i
-            for i, (a_b, s_b) in enumerate(zip(a.broadcastable, shape_bcast[-a.ndim :]))
-            if a_b and not s_b
+            for i, (a_s, s_s) in enumerate(zip(a.type.shape, static_shape[-a.ndim :]))
+            if a_s == 1 and s_s != 1
         ]
 
         if bcast_sums:
@@ -1600,6 +1683,56 @@ class BroadcastTo(Op):
 
     def infer_shape(self, fgraph, node, ins_shapes):
         return [node.inputs[1:]]
+
+    def c_code(self, node, name, inputs, outputs, sub):
+        (x, *shape) = inputs
+        (out,) = outputs
+        ndims = len(shape)
+        fail = sub["fail"]
+
+        # TODO: Could just use `PyArray_Return`, no?
+        dims_array = ", ".join(
+            [
+                f"((dtype_{shape}*)(PyArray_DATA({shape})))[0]"
+                for i, shape in enumerate(shape)
+            ]
+        )
+
+        src = (
+            """
+            npy_intp itershape[%(ndims)s] = {%(dims_array)s};
+
+            PyArrayObject *ops[1] = {%(x)s};
+            npy_uint32 flags = NPY_ITER_MULTI_INDEX | NPY_ITER_REFS_OK | NPY_ITER_ZEROSIZE_OK;
+            npy_uint32 op_flags[1] = {NPY_ITER_READONLY};
+            PyArray_Descr *op_dtypes[1] = {NULL};
+            int oa_ndim = %(ndims)s;
+            int* op_axes[1] = {NULL};
+            npy_intp buffersize = 0;
+
+            NpyIter *iter = NpyIter_AdvancedNew(
+                1, ops, flags, NPY_CORDER, NPY_NO_CASTING, op_flags, op_dtypes, oa_ndim, op_axes, itershape, buffersize
+            );
+
+            %(out)s = NpyIter_GetIterView(iter, 0);
+
+            if(%(out)s == NULL){
+                NpyIter_Deallocate(iter);
+                %(fail)s;
+            }
+
+            if (NpyIter_Deallocate(iter) != NPY_SUCCEED) {
+                %(fail)s;
+            }
+
+            """
+            % locals()
+        )
+
+        return src
+
+    def c_code_cache_version(self):
+        return (1,)
 
 
 broadcast_to_ = BroadcastTo()

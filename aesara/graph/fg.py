@@ -1,12 +1,14 @@
 """A container for specifying and manipulating a graph with distinct inputs and outputs."""
 import time
 from collections import OrderedDict
+from types import MethodType
 from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
     Iterable,
     List,
+    Literal,
     Optional,
     Sequence,
     Set,
@@ -14,8 +16,6 @@ from typing import (
     Union,
     cast,
 )
-
-from typing_extensions import Literal
 
 import aesara
 from aesara.configdefaults import config
@@ -72,7 +72,7 @@ class FunctionGraph(MetaObject):
         outputs: Optional[Sequence[Variable]] = None,
         features: Optional[Sequence[Feature]] = None,
         clone: bool = True,
-        update_mapping: Optional[Dict[Variable, Variable]] = None,
+        update_mapping: Optional[Dict[int, int]] = None,
         **clone_kwds,
     ):
         """
@@ -90,8 +90,8 @@ class FunctionGraph(MetaObject):
         clone
             If ``True``, the graph will be cloned.
         update_mapping
-            Mapping between the `inputs` with updates and the `outputs`
-            corresponding to their updates.
+            Mapping between the `outputs` indices of update graphs and the `inputs`
+            indices that are updated with the former's values.
         clone_kwds
             Keywords passed to `clone_get_equiv` when `clone` is ``True``.
         """
@@ -153,7 +153,18 @@ class FunctionGraph(MetaObject):
             self.add_output(output, reason="init")
 
         self.profile = None
-        self.update_mapping = update_mapping
+
+        self.set_update_mapping(update_mapping)
+
+    def set_update_mapping(self, update_mapping):
+        self.update_mapping = {}
+        self.inv_update_mapping = {}
+
+        if update_mapping:
+            for k, v in update_mapping.items():
+                self.update_mapping[k] = v
+                # `update_mapping` should be bijective, making this reasonable
+                self.inv_update_mapping[v] = k
 
     def add_output(
         self, var: Variable, reason: Optional[str] = None, import_missing: bool = False
@@ -481,7 +492,7 @@ class FunctionGraph(MetaObject):
             verbose = config.optimizer_verbose
         if verbose:
             print(
-                f"optimizer: rewrite {reason} replaces {var} of {var.owner} with {new_var} of {new_var.owner}"
+                f"rewriting: rewrite {reason} replaces {var} of {var.owner} with {new_var} of {new_var.owner}"
             )
 
         new_var = var.type.filter_variable(new_var, allow_convert=True)
@@ -540,13 +551,23 @@ class FunctionGraph(MetaObject):
         self.outputs.pop(idx)
 
         new_idx = 0
-        for (out, old_idx) in old_idx_mappings:
+        for out, old_idx in old_idx_mappings:
+            # We need to update `update_mappings`, as well
+            map_in_idx = self.update_mapping.pop(old_idx, None)
+            self.inv_update_mapping.pop(map_in_idx, None)
+
             if old_idx == idx:
                 continue
+
+            if map_in_idx is not None:
+                self.update_mapping[new_idx] = map_in_idx
+                self.inv_update_mapping[map_in_idx] = new_idx
+
             out_clients = self.clients[out]
             arrow: ClientType = ("output", old_idx)
             arrow_idx = out_clients.index(arrow)
             out_clients[arrow_idx] = ("output", new_idx)
+
             new_idx += 1
 
     def remove_node(self, node: Apply, reason: Optional[str] = None):
@@ -575,7 +596,6 @@ class FunctionGraph(MetaObject):
                 out_client, out_idx = out_clients.pop()
 
                 if out_client == "output":
-
                     self._remove_output(out_idx)
 
                     # TODO: We could short-circuit all of the graph walking and
@@ -601,7 +621,6 @@ class FunctionGraph(MetaObject):
         # Remove all the arrows pointing to this `node`, and any orphaned
         # variables created by removing those arrows
         for inp_idx, inp in enumerate(node.inputs):
-
             inp_clients: List[ClientType] = self.clients.get(inp, [])
 
             arrow = (node, inp_idx)
@@ -637,7 +656,18 @@ class FunctionGraph(MetaObject):
 
     def remove_input(self, input_idx: int, reason: Optional[str] = None):
         """Remove the input at index `input_idx`."""
+
         var = self.inputs.pop(input_idx)
+
+        for in_idx, out_idx in tuple(self.inv_update_mapping.items()):
+            if in_idx == input_idx:
+                del self.update_mapping[out_idx]
+                del self.inv_update_mapping[in_idx]
+            elif in_idx > input_idx:
+                new_in_idx = in_idx - 1
+                self.update_mapping[out_idx] = new_in_idx
+                del self.inv_update_mapping[in_idx]
+                self.inv_update_mapping[new_in_idx] = out_idx
 
         for client, idx in list(self.clients[var]):
             if client == "output":
@@ -667,26 +697,19 @@ class FunctionGraph(MetaObject):
         """Add a ``graph.features.Feature`` to this function graph and trigger its ``on_attach`` callback."""
         # Filter out literally identical `Feature`s
         if feature in self._features:
-            return  # the feature is already present
+            return
 
         # Filter out functionally identical `Feature`s.
-        # `Feature`s may use their `on_attach` method to raise
-        # `AlreadyThere` if they detect that some
-        # installed `Feature` does the same thing already
-        attach = getattr(feature, "on_attach", None)
-        if attach is not None:
-            try:
-                attach(self)
-            except AlreadyThere:
-                return
-        self.execute_callbacks_times.setdefault(feature, 0.0)
-        # It would be nice if we could require a specific class instead of
-        # a "workalike" so we could do actual error checking
-        # if not isinstance(feature, Feature):
-        #    raise TypeError("Expected Feature instance, got "+\
-        #            str(type(feature)))
+        # `Feature`s may use their `on_attach` method to raise `AlreadyThere`
+        # if they detect that some installed `Feature` does the same thing
+        # already
+        try:
+            feature.on_attach(self)
+        except AlreadyThere:
+            return
 
-        # Add the feature
+        self.execute_callbacks_times.setdefault(feature, 0.0)
+
         self._features.append(feature)
 
     def remove_feature(self, feature: Feature) -> None:
@@ -701,9 +724,8 @@ class FunctionGraph(MetaObject):
             self._features.remove(feature)
         except ValueError:
             return
-        detach = getattr(feature, "on_detach", None)
-        if detach is not None:
-            detach(self)
+
+        feature.on_detach(self)
 
     def execute_callbacks(self, name: str, *args, **kwargs) -> None:
         """Execute callbacks.
@@ -712,7 +734,7 @@ class FunctionGraph(MetaObject):
         a method called after name.
 
         """
-        t0 = time.time()
+        t0 = time.perf_counter()
         for feature in self._features:
             try:
                 fn = getattr(feature, name)
@@ -721,10 +743,10 @@ class FunctionGraph(MetaObject):
                 # try; the AttributeError really must come from feature.${name}
                 # not existing
                 continue
-            tf0 = time.time()
+            tf0 = time.perf_counter()
             fn(self, *args, **kwargs)
-            self.execute_callbacks_times[feature] += time.time() - tf0
-        self.execute_callbacks_time += time.time() - t0
+            self.execute_callbacks_times[feature] += time.perf_counter() - tf0
+        self.execute_callbacks_time += time.perf_counter() - t0
 
     def collect_callbacks(self, name: str, *args) -> Dict[Feature, Any]:
         """Collects callbacks
@@ -903,20 +925,17 @@ class FunctionGraph(MetaObject):
         return e, equiv
 
     def __getstate__(self):
-        # This is needed as some features introduce instance methods
-        # This is not picklable
-        d = self.__dict__.copy()
-        for feature in self._features:
-            for attr in getattr(feature, "pickle_rm_attr", []):
-                del d[attr]
-        # The class Updater take fct as parameter and they are lambda function, so unpicklable.
+        # Remove methods that were attached by features
+        self_dict = {
+            k: v for k, v in self.__dict__.items() if not isinstance(v, MethodType)
+        }
 
-        # execute_callbacks_times have reference to optimizer, and they can't
-        # be pickled as the decorators with parameters aren't pickable.
-        if "execute_callbacks_times" in d:
-            del d["execute_callbacks_times"]
+        # `execute_callbacks_times` holds references to optimizers, so they
+        # can't be pickled
+        if "execute_callbacks_times" in self_dict:
+            del self_dict["execute_callbacks_times"]
 
-        return d
+        return self_dict
 
     def __setstate__(self, dct):
         self.__dict__.update(dct)

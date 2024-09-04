@@ -1,14 +1,21 @@
 """Symbolic tensor types and constructor functions."""
 
 from functools import singledispatch
-from typing import Any, Callable, NoReturn, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
 
 from aesara.graph.basic import Constant, Variable
 from aesara.graph.op import Op
 
 
+if TYPE_CHECKING:
+    from numpy.typing import ArrayLike
+
+
+TensorLike = Union[Variable, Sequence[Variable], "ArrayLike"]
+
+
 def as_tensor_variable(
-    x: Any, name: Optional[str] = None, ndim: Optional[int] = None, **kwargs
+    x: TensorLike, name: Optional[str] = None, ndim: Optional[int] = None, **kwargs
 ) -> "TensorVariable":
     """Convert `x` into an equivalent `TensorVariable`.
 
@@ -44,12 +51,12 @@ def as_tensor_variable(
 
 @singledispatch
 def _as_tensor_variable(
-    x, name: Optional[str], ndim: Optional[int], **kwargs
+    x: TensorLike, name: Optional[str], ndim: Optional[int], **kwargs
 ) -> "TensorVariable":
-    raise NotImplementedError(f"Cannot convert {x} to a tensor variable.")
+    raise NotImplementedError(f"Cannot convert {x!r} to a tensor variable.")
 
 
-def get_vector_length(v: Any):
+def get_vector_length(v: TensorLike) -> int:
     """Return the run-time length of a symbolic vector, when possible.
 
     Parameters
@@ -73,20 +80,21 @@ def get_vector_length(v: Any):
     if v.type.ndim != 1:
         raise TypeError(f"Argument must be a vector; got {v.type}")
 
-    if v.type.broadcastable[0]:
-        return 1
+    static_shape: Optional[int] = v.type.shape[0]
+    if static_shape is not None:
+        return static_shape
 
     return _get_vector_length(getattr(v.owner, "op", v), v)
 
 
 @singledispatch
-def _get_vector_length(op: Union[Op, Variable], var: Variable):
+def _get_vector_length(op: Union[Op, Variable], var: Variable) -> int:
     """`Op`-based dispatch for `get_vector_length`."""
     raise ValueError(f"Length of {var} cannot be determined")
 
 
 @_get_vector_length.register(Constant)
-def _get_vector_length_Constant(var_inst, var):
+def _get_vector_length_Constant(op: Union[Op, Variable], var: Constant) -> int:
     return len(var.data)
 
 
@@ -96,19 +104,17 @@ from aesara.gradient import consider_constant, grad, hessian, jacobian  # noqa
 # adds shared-variable constructors
 from aesara.tensor import sharedvar  # noqa
 from aesara.tensor import (  # noqa
-    basic_opt,
     blas,
     blas_c,
     blas_scipy,
-    nnet,
-    opt_uncanonicalize,
-    subtensor_opt,
     xlogx,
 )
+import aesara.tensor.rewriting
 
 
 # isort: off
 from aesara.tensor import linalg  # noqa
+from aesara.tensor import special
 
 # For backward compatibility
 from aesara.tensor import nlinalg  # noqa
@@ -143,3 +149,27 @@ from aesara.tensor.var import TensorConstant, TensorVariable  # noqa
 
 
 __all__ = ["random"]  # noqa: F405
+
+# isort: off
+from aesara.tensor.math import DEPRECATED_NAMES as MATH_DEPRECATED_NAMES
+
+# isort: on
+
+
+DEPRECATED_NAMES: List[Tuple[str, str, object]] = MATH_DEPRECATED_NAMES
+
+
+def __getattr__(name):
+    """Intercept module-level attribute access of deprecated symbols.
+
+    Adapted from https://stackoverflow.com/a/55139609/3006474.
+
+    """
+    from warnings import warn
+
+    for old_name, msg, old_object in DEPRECATED_NAMES:
+        if name == old_name:
+            warn(msg, DeprecationWarning, stacklevel=2)
+            return old_object
+
+    raise AttributeError(f"module {__name__} has no attribute {name}")

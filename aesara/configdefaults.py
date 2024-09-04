@@ -1,4 +1,3 @@
-import distutils.spawn
 import errno
 import logging
 import os
@@ -9,6 +8,7 @@ import sys
 import textwrap
 
 import numpy as np
+from setuptools._distutils.spawn import find_executable
 
 import aesara
 import aesara.configparser
@@ -278,7 +278,6 @@ def short_platform(r=None, p=None):
 
 
 def add_basic_configvars():
-
     config.add(
         "floatX",
         "Default floating-point precision for python casts.\n"
@@ -388,7 +387,6 @@ def _is_greater_or_equal_0(x):
 
 
 def add_compile_configvars():
-
     config.add(
         "mode",
         "Default compilation mode",
@@ -437,7 +435,7 @@ def add_compile_configvars():
 
     # Try to find the full compiler path from the name
     if param != "":
-        newp = distutils.spawn.find_executable(param)
+        newp = find_executable(param)
         if newp is not None:
             param = newp
         del newp
@@ -631,7 +629,6 @@ def _is_valid_cmp_sloppy(v):
 
 
 def add_tensor_configvars():
-
     # This flag is used when we import Aesara to initialize global variables.
     # So changing it after import will not modify these global variables.
     # This could be done differently... but for now we simply prevent it from being
@@ -717,7 +714,6 @@ def add_experimental_configvars():
 
 
 def add_error_and_warning_configvars():
-
     ###
     # To disable some warning about old bug that are fixed now.
     ###
@@ -1107,7 +1103,7 @@ def add_optimizer_configvars():
 
     config.add(
         "optdb__max_use_ratio",
-        "A ratio that prevent infinite loop in EquilibriumOptimizer.",
+        "A ratio that prevent infinite loop in EquilibriumGraphRewriter.",
         FloatParam(8),
         in_c_key=False,
     )
@@ -1196,7 +1192,6 @@ def add_vm_configvars():
 
 
 def add_deprecated_configvars():
-
     # TODO: remove this?
     config.add(
         "unittests__rseed",
@@ -1300,7 +1295,8 @@ def _filter_compiledir(path):
     init_file = os.path.join(path, "__init__.py")
     if not os.path.exists(init_file):
         try:
-            open(init_file, "w").close()
+            with open(init_file, "w"):
+                pass
         except OSError as e:
             if os.path.exists(init_file):
                 pass  # has already been created

@@ -23,7 +23,7 @@ if not config.cxx:
 
 _logger = logging.getLogger("aesara.scan.scan_perform")
 
-version = 0.315  # must match constant returned in function get_version()
+version = 0.326  # must match constant returned in function get_version()
 
 need_reload = False
 scan_perform: Optional[ModuleType] = None
@@ -49,7 +49,6 @@ try:
     if version != getattr(scan_perform, "_version", None):
         raise ImportError("Scan code version mismatch")
 except ImportError:
-
     dirname = "scan_perform"
     loc = os.path.join(config.compiledir, dirname)
 

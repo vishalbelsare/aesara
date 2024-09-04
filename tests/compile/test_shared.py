@@ -26,7 +26,6 @@ from aesara.utils import PYTHON_INT_BITWIDTH
 
 class TestSharedVariable:
     def test_ctors(self):
-
         if PYTHON_INT_BITWIDTH == 32:
             assert shared(7).type == iscalar, shared(7).type
         else:
@@ -36,11 +35,11 @@ class TestSharedVariable:
 
         # test tensor constructor
         b = shared(np.zeros((5, 5), dtype="int32"))
-        assert b.type == TensorType("int32", shape=[False, False])
+        assert b.type == TensorType("int32", shape=(None, None))
         b = shared(np.random.random((4, 5)))
-        assert b.type == TensorType("float64", shape=[False, False])
+        assert b.type == TensorType("float64", shape=(None, None))
         b = shared(np.random.random((5, 1, 2)))
-        assert b.type == TensorType("float64", shape=[False, False, False])
+        assert b.type == TensorType("float64", shape=(None, None, None))
 
         assert shared([]).type == generic
 
@@ -51,7 +50,6 @@ class TestSharedVariable:
             badfunc()
 
     def test_strict_generic(self):
-
         # this should work, because
         # generic can hold anything even when strict=True
 
@@ -62,12 +60,11 @@ class TestSharedVariable:
         v.set_value(88)
 
     def test_create_numpy_strict_false(self):
-
         # here the value is perfect, and we're not strict about it,
         # so creation should work
         SharedVariable(
             name="u",
-            type=TensorType(shape=[False], dtype="float64"),
+            type=TensorType(dtype="float64", shape=(None,)),
             value=np.asarray([1.0, 2.0]),
             strict=False,
         )
@@ -76,7 +73,7 @@ class TestSharedVariable:
         # so creation should work
         SharedVariable(
             name="u",
-            type=TensorType(shape=[False], dtype="float64"),
+            type=TensorType(dtype="float64", shape=(None,)),
             value=[1.0, 2.0],
             strict=False,
         )
@@ -85,7 +82,7 @@ class TestSharedVariable:
         # so creation should work
         SharedVariable(
             name="u",
-            type=TensorType(shape=[False], dtype="float64"),
+            type=TensorType(dtype="float64", shape=(None,)),
             value=[1, 2],  # different dtype and not a numpy array
             strict=False,
         )
@@ -95,7 +92,7 @@ class TestSharedVariable:
         try:
             SharedVariable(
                 name="u",
-                type=TensorType(shape=[False], dtype="float64"),
+                type=TensorType(dtype="float64", shape=(None,)),
                 value=dict(),  # not an array by any stretch
                 strict=False,
             )
@@ -104,12 +101,11 @@ class TestSharedVariable:
             pass
 
     def test_use_numpy_strict_false(self):
-
         # here the value is perfect, and we're not strict about it,
         # so creation should work
         u = SharedVariable(
             name="u",
-            type=TensorType(shape=[False], dtype="float64"),
+            type=TensorType(dtype="float64", shape=(None,)),
             value=np.asarray([1.0, 2.0]),
             strict=False,
         )
@@ -166,7 +162,7 @@ class TestSharedVariable:
         with pytest.raises(TypeError):
             f(b, 8)
 
-        b = shared(np.float(7.234), strict=True)
+        b = shared(float(7.234), strict=True)
         assert b.type == dscalar
         with pytest.raises(TypeError):
             f(b, 8)
@@ -214,8 +210,8 @@ class TestSharedVariable:
         with pytest.raises(TypeError):
             f(b, 8)
 
-        # np.float([7.234]) don't work
-        #        b = shared(np.float([7.234]), strict=True)
+        # float([7.234]) don't work
+        #        b = shared(float([7.234]), strict=True)
         #        assert b.type == dvector
         #        with pytest.raises(TypeError):
         #            f(b, 8)
@@ -231,7 +227,6 @@ class TestSharedVariable:
             f(b, np.random.random((5, 5)))
 
     def test_scalar_floatX(self):
-
         # the test should assure that floatX is not used in the shared
         # constructor for scalars Shared values can change, and since we don't
         # know the range they might take, we should keep the same
@@ -273,7 +268,7 @@ class TestSharedVariable:
         f(b, 8)
         assert b.get_value() == 8
 
-        b = shared(np.float(7.234), allow_downcast=True)
+        b = shared(float(7.234), allow_downcast=True)
         assert b.type == dscalar
         f(b, 8)
         assert b.get_value() == 8
@@ -321,8 +316,8 @@ class TestSharedVariable:
         f(b, [8])
         assert b.get_value() == 8
 
-        # np.float([7.234]) don't work
-        #        b = shared(np.float([7.234]))
+        # float([7.234]) don't work
+        #        b = shared(float([7.234]))
         #        assert b.type == dvector
         #        f(b,[8])
 

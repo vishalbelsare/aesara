@@ -14,7 +14,7 @@ from aesara.scan.utils import expand_empty, safe_new, until
 from aesara.tensor.basic import get_scalar_constant_value
 from aesara.tensor.exceptions import NotScalarConstantError
 from aesara.tensor.math import minimum
-from aesara.tensor.shape import shape_padleft
+from aesara.tensor.shape import shape_padleft, unbroadcast
 from aesara.tensor.type import TensorType, integer_dtypes
 from aesara.updates import OrderedUpdates
 
@@ -609,11 +609,9 @@ def scan(
                             # No need to print a warning or raise an error now,
                             # it will be done when fn will be called.
                             warnings.warn(
-                                (
-                                    "Cannot compute test value for "
-                                    "the inner function of scan, input value "
-                                    f"missing {_seq_val_slice}"
-                                )
+                                "Cannot compute test value for "
+                                "the inner function of scan, input value "
+                                f"missing {_seq_val_slice}"
                             )
 
                 # Add names to slices for debugging and pretty printing ..
@@ -720,7 +718,6 @@ def scan(
         # they would always had to shape_padleft the initial state ..
         # which is ugly
         if init_out.get("taps", None) == [-1]:
-
             actual_arg = init_out["initial"]
             if not isinstance(actual_arg, Variable):
                 actual_arg = at.as_tensor_variable(actual_arg)
@@ -737,10 +734,8 @@ def scan(
                 except TestValueError:
                     if config.compute_test_value != "ignore":
                         warnings.warn(
-                            (
-                                "Cannot compute test value for the "
-                                f"inner function of scan, test value missing: {actual_arg}"
-                            )
+                            "Cannot compute test value for the "
+                            f"inner function of scan, test value missing: {actual_arg}"
                         )
 
             if getattr(init_out["initial"], "name", None) is not None:
@@ -751,7 +746,7 @@ def scan(
             # defined in scan utils
             sit_sot_scan_inputs.append(
                 expand_empty(
-                    at.unbroadcast(shape_padleft(actual_arg), 0),
+                    unbroadcast(shape_padleft(actual_arg), 0),
                     actual_n_steps,
                 )
             )
@@ -764,7 +759,6 @@ def scan(
             n_sit_sot += 1
 
         elif init_out.get("taps", None):
-
             if np.any(np.array(init_out.get("taps", [])) > 0):
                 # Make sure we do not have requests for future values of a
                 # sequence we can not provide such values
@@ -795,11 +789,9 @@ def scan(
                     except TestValueError:
                         if config.compute_test_value != "ignore":
                             warnings.warn(
-                                (
-                                    "Cannot compute test value for "
-                                    "the inner function of scan, test value "
-                                    f"missing: {_init_out_var_slice}"
-                                )
+                                "Cannot compute test value for "
+                                "the inner function of scan, test value "
+                                f"missing: {_init_out_var_slice}"
                             )
 
                 # give it a name or debugging and pretty printing
@@ -881,7 +873,7 @@ def scan(
             # this will represent only a slice and it will have one
             # dimension less.
             if isinstance(inner_out.type, TensorType) and return_steps.get(pos, 0) != 1:
-                outputs[pos] = at.unbroadcast(shape_padleft(inner_out), 0)
+                outputs[pos] = unbroadcast(shape_padleft(inner_out), 0)
 
         if not return_list and len(outputs) == 1:
             outputs = outputs[0]
@@ -996,8 +988,8 @@ def scan(
             # We also don't want to remove a default update that applies to
             # the scope/context containing this `Scan`, so we only remove
             # default updates on "local" variables.
-            if is_local and hasattr(input.variable, "default_update"):
-                del input.variable.default_update
+            if is_local and input.variable.default_update is not None:
+                input.variable.default_update = None
 
             new_var = safe_new(input.variable)
 
@@ -1010,7 +1002,7 @@ def scan(
                 sit_sot_inner_inputs.append(new_var)
                 sit_sot_scan_inputs.append(
                     expand_empty(
-                        at.unbroadcast(shape_padleft(input.variable), 0),
+                        unbroadcast(shape_padleft(input.variable), 0),
                         actual_n_steps,
                     )
                 )

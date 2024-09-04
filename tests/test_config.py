@@ -2,6 +2,7 @@
 import configparser as stdlib_configparser
 import io
 import pickle
+import warnings
 
 import pytest
 
@@ -20,7 +21,8 @@ def _create_test_config():
 
 def test_api_deprecation_warning():
     # accessing through configdefaults.config is the new best practice
-    with pytest.warns(None):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         root = configdefaults.config
         assert isinstance(str(root), str)
 
@@ -244,7 +246,6 @@ def test_no_more_dotting():
 
 
 def test_mode_apply():
-
     assert configdefaults._filter_mode("DebugMode") == "DebugMode"
 
     with pytest.raises(ValueError, match="Expected one of"):

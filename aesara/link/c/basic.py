@@ -3,12 +3,11 @@ Defines Linkers that deal with C implementations.
 
 """
 import logging
-import os
 import sys
 from collections import defaultdict
 from copy import copy
 from io import StringIO
-from typing import Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 
@@ -21,7 +20,6 @@ from aesara.graph.basic import (
     io_toposort,
     vars_between,
 )
-from aesara.graph.callcache import CallCache
 from aesara.link.basic import Container, Linker, LocalLinker, PerformLinker
 from aesara.link.c.cmodule import (
     METH_VARARGS,
@@ -36,13 +34,14 @@ from aesara.link.utils import gc_helper, map_storage, raise_with_op, streamline
 from aesara.utils import difference, uniq
 
 
+if TYPE_CHECKING:
+    from aesara.graph.fg import FunctionGraph
+    from aesara.link.c.cmodule import ModuleCache
+
 _logger = logging.getLogger("aesara.link.c.basic")
 
 
-run_cthunk = None  # Will be imported only when needed.
-
-
-def get_module_cache(init_args=None):
+def get_module_cache(init_args: Optional[Dict[str, Any]] = None) -> "ModuleCache":
     """
 
     Parameters
@@ -53,18 +52,6 @@ def get_module_cache(init_args=None):
 
     """
     return _get_module_cache(config.compiledir, init_args=init_args)
-
-
-_persistent_module_cache = None
-
-
-def get_persistent_module_cache():
-    global _persistent_module_cache
-    if _persistent_module_cache is None:
-        _persistent_module_cache = CallCache(
-            os.path.join(config.compiledir, "persistent_cache")
-        )
-    return _persistent_module_cache
 
 
 class CodeBlock:
@@ -594,7 +581,9 @@ class CLinker(Linker):
         self.fgraph = None
         super().__init__(scheduler=schedule)
 
-    def accept(self, fgraph, no_recycling=None, profile=None):
+    def accept(
+        self, fgraph: "FunctionGraph", no_recycling=None, profile=None
+    ) -> "CLinker":
         r"""Associate this `Linker` with `fgraph`.
 
         The `no_recycling` argument can contain a list of `Variable`\s that
@@ -710,7 +699,6 @@ class CLinker(Linker):
         id = 1
 
         for variable in self.variables:
-
             if not isinstance(variable.type, CLinkerType):
                 raise NotImplementedError(f"Type of {variable} cannot produce C code")
 
@@ -808,7 +796,6 @@ class CLinker(Linker):
             id += 2
 
         for node_num, node in enumerate(self.node_order):
-
             op = node.op
 
             if not isinstance(op, CLinkerOp):
@@ -1094,18 +1081,18 @@ class CLinker(Linker):
         input_storage=None,
         output_storage=None,
         storage_map=None,
+        cache: Optional["ModuleCache"] = None,
     ):
-        """
-        Compiles this linker's fgraph.
+        """Compile `self.fgraph`.
 
         Parameters
         ----------
         input_storage: list or None
             List of lists of length 1. In order to use the thunk returned
-            by __compile__, the inputs must be put in that storage.
+            by this method, the inputs must be put in that storage.
             If None, storage will be allocated.
         output_storage: list of lists of length 1
-            The thunk returned by __compile__ will put the variables of the
+            The thunk returned by this method will put the variables of the
             computation in these lists. If None, storage will be allocated.
 
         Returns
@@ -1135,6 +1122,7 @@ class CLinker(Linker):
             input_storage,
             output_storage,
             storage_map,
+            cache,
         )
         return (
             thunk,
@@ -1166,37 +1154,51 @@ class CLinker(Linker):
             id += 2
         return init_tasks, tasks
 
-    def make_thunk(self, input_storage=None, output_storage=None, storage_map=None):
-        """
-        Compiles this linker's fgraph and returns a function to perform the
-        computations, as well as lists of storage cells for both the inputs
-        and outputs.
+    def make_thunk(
+        self,
+        input_storage=None,
+        output_storage=None,
+        storage_map=None,
+        cache: Optional["ModuleCache"] = None,
+        **kwargs,
+    ):
+        """Compile this linker's `self.fgraph` and return a function that performs the computations.
+
+        The return values can be used as follows:
+
+        .. code-block::
+
+            f, istor, ostor = clinker.make_thunk()
+            istor[0].data = first_input
+            istor[1].data = second_input
+            f()
+            first_output = ostor[0].data
+
 
         Parameters
         ----------
         input_storage: list or None
             List of lists of length 1. In order to use
-            the thunk returned by __compile__, the inputs must be put in
+            the thunk returned by `CLinker.__compile__`, the inputs must be put in
             that storage. If None, storage will be allocated.
         output_storage: list of lists of length 1.
-            The thunk returned by __compile__ will put the variables
+            The thunk returned by `CLinker.__compile__` will put the variables
             of the computation in these lists. If None, storage will
             be allocated.
         storage_map: dict that map variables to storages.
             This is used when you need to customize the storage of
             this thunk
-        Returns: thunk, input_storage, output_storage
+        cache
+            A cache in which to store the compilation results.
 
-        The return values can be used as follows:
-          f, istor, ostor = clinker.make_thunk()
-          istor[0].data = first_input
-          istor[1].data = second_input
-          f()
-          first_output = ostor[0].data
+        Returns
+        -------
+        thunk, input_storage, output_storage
+
         """
         init_tasks, tasks = self.get_init_tasks()
         cthunk, module, in_storage, out_storage, error_storage = self.__compile__(
-            input_storage, output_storage, storage_map
+            input_storage, output_storage, storage_map, cache
         )
 
         res = _CThunk(cthunk, init_tasks, tasks, error_storage, module)
@@ -1296,7 +1298,6 @@ class CLinker(Linker):
         insert_config_hash=True,
         c_compiler=None,
     ):
-
         # Assemble a dummy fgraph using the provided inputs and outputs. It is
         # only used to compute the cmodule key so it only need to expose an
         # `inputs` and an `outputs` attribute as well as a toposort() method
@@ -1456,8 +1457,12 @@ class CLinker(Linker):
         for node_pos, node in enumerate(order):
             if hasattr(node.op, "c_code_cache_version_apply"):
                 version.append(node.op.c_code_cache_version_apply(node))
-            if hasattr(node.op, "__props__"):
-                version.append(node.op.__props__)
+
+            props = getattr(node.op, "__props__", None)
+
+            if props:
+                version.append(props)
+
             for i in node.inputs:
                 if isinstance(i.type, CLinkerObject):
                     version.append(i.type.c_code_cache_version())
@@ -1598,7 +1603,14 @@ class CLinker(Linker):
             self._mod = mod
         return self._mod
 
-    def cthunk_factory(self, error_storage, in_storage, out_storage, storage_map=None):
+    def cthunk_factory(
+        self,
+        error_storage,
+        in_storage,
+        out_storage,
+        storage_map=None,
+        cache: Optional["ModuleCache"] = None,
+    ):
         """
         Returns a thunk that points to an instance of a C struct that
         can carry on the computation of this linker's fgraph
@@ -1619,6 +1631,7 @@ class CLinker(Linker):
             key = self.cmodule_key()
         except KeyError:
             key = None
+
         if key is None:
             # If we can't get a key, then forget the cache mechanism.
             module = self.compile_cmodule()
@@ -1626,7 +1639,9 @@ class CLinker(Linker):
             # Set compute_map as None as clinker do not support lazy evaluation
             for node in self.node_order:
                 node.op.prepare_node(node, storage_map, None, "c")
-            module = get_module_cache().module_from_key(key=key, lnk=self)
+            if cache is None:
+                cache = get_module_cache()
+            module = cache.module_from_key(key=key, lnk=self)
 
         vars = self.inputs + self.outputs + self.orphans
         # List of indices that should be ignored when passing the arguments
@@ -1680,16 +1695,14 @@ class CLinker(Linker):
         print("    return NULL;", file=code)
         print("  }", file=code)
         print(
-            """\
+            f"""\
     PyObject* thunk = PyCapsule_New((void*)(&{struct_name}_executor), NULL, {struct_name}_destructor);
     if (thunk != NULL && PyCapsule_SetContext(thunk, struct_ptr) != 0) {{
         PyErr_Clear();
         Py_DECREF(thunk);
         thunk = NULL;
     }}
-""".format(
-                **locals()
-            ),
+""",
             file=code,
         )
         print("  return thunk; }", file=code)
@@ -1703,7 +1716,7 @@ class _CThunk:
     Parameters
     ----------
     cthunk
-        The CObject pointer used by run_cthunk.
+        A CObject pointer that is used to run the thunk.
     init_tasks
         WRITEME
     tasks
@@ -1717,15 +1730,16 @@ class _CThunk:
     """
 
     def __init__(self, cthunk, init_tasks, tasks, error_storage, module):
-        global run_cthunk
-        if run_cthunk is None:
-            # Lazy import to avoid compilation when importing aesara.
-            from aesara.link.c.cutils import run_cthunk  # noqa
+        # Lazy import to avoid compilation when importing aesara.
+        from aesara.link.c.cutils import run_cthunk  # noqa
+
+        self.run_cthunk = run_cthunk
         self.cthunk = cthunk
         self.init_tasks = init_tasks
         self.tasks = tasks
         self.error_storage = error_storage
         self.module = module
+        self.nodes = None
 
     def find_task(self, failure_code):
         """
@@ -1741,7 +1755,7 @@ class _CThunk:
             return self.tasks[failure_code - n]
 
     def __call__(self):
-        failure = run_cthunk(self.cthunk)
+        failure = self.run_cthunk(self.cthunk)
         if failure:
             task, taskname, id = self.find_task(failure)
             try:
@@ -1829,7 +1843,6 @@ class OpWiseCLinker(LocalLinker):
     def make_all(
         self, profiler=None, input_storage=None, output_storage=None, storage_map=None
     ):
-
         fgraph = self.fgraph
         order = self.schedule(fgraph)
         no_recycling = self.no_recycling

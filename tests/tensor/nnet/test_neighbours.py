@@ -184,7 +184,6 @@ class TestImages2Neibs(unittest_tools.InferShapeTester):
                 f()
 
     def test_neibs_wrap_centered_step_manual(self):
-
         expected1 = [
             [24, 20, 21, 4, 0, 1, 9, 5, 6],
             [21, 22, 23, 1, 2, 3, 6, 7, 8],
@@ -245,9 +244,7 @@ class TestImages2Neibs(unittest_tools.InferShapeTester):
                 [(1, 1, 1045, 5), (3, 3), (3, 3), None],
             ]
         ):
-
             for dtype in self.dtypes:
-
                 images = shared(
                     np.asarray(np.arange(np.prod(shape)).reshape(shape), dtype=dtype)
                 )
@@ -476,7 +473,7 @@ class TestImages2Neibs(unittest_tools.InferShapeTester):
 
         f = aesara.function(
             [images],
-            at.sqr(images2neibs(images, (2, 2), mode="valid")),
+            at.square(images2neibs(images, (2, 2), mode="valid")),
             mode=self.mode,
         )
         with pytest.raises(TypeError):
@@ -488,7 +485,9 @@ class TestImages2Neibs(unittest_tools.InferShapeTester):
         images_val = np.arange(np.prod(shape), dtype="float32").reshape(shape)
 
         f = aesara.function(
-            [images], at.sqr(images2neibs(images, (2, 2), mode="half")), mode=self.mode
+            [images],
+            at.square(images2neibs(images, (2, 2), mode="half")),
+            mode=self.mode,
         )
         with pytest.raises(TypeError):
             f(images_val)
@@ -499,7 +498,9 @@ class TestImages2Neibs(unittest_tools.InferShapeTester):
         images_val = np.arange(np.prod(shape), dtype="float32").reshape(shape)
 
         f = aesara.function(
-            [images], at.sqr(images2neibs(images, (2, 2), mode="full")), mode=self.mode
+            [images],
+            at.square(images2neibs(images, (2, 2), mode="full")),
+            mode=self.mode,
         )
         with pytest.raises(TypeError):
             f(images_val)

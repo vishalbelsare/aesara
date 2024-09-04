@@ -6,6 +6,7 @@ import pytest
 
 import aesara
 import aesara.ifelse
+import aesara.sparse
 import aesara.tensor.basic as at
 from aesara import function
 from aesara.compile.mode import Mode, get_mode
@@ -14,13 +15,17 @@ from aesara.graph.op import Op
 from aesara.ifelse import IfElse, ifelse
 from aesara.link.c.type import generic
 from aesara.tensor.math import eq
-from aesara.tensor.type import col, iscalar, matrix, row, scalar, tensor3, vector
+from aesara.tensor.type import (
+    col,
+    iscalar,
+    ivector,
+    matrix,
+    row,
+    scalar,
+    tensor3,
+    vector,
+)
 from tests import unittest_tools as utt
-
-
-__docformat__ = "restructedtext en"
-__authors__ = "Razvan Pascanu " "PyMC Development Team " "Aesara Developers "
-__copyright__ = "(c) 2010, Universite de Montreal"
 
 
 class TestIfelse(utt.OptimizationTestMixin):
@@ -41,7 +46,7 @@ class TestIfelse(utt.OptimizationTestMixin):
         with pytest.raises(ValueError):
             IfElse(0)(c, x, x)
 
-    def test_const_Op_argument(self):
+    def test_const_false_branch(self):
         x = vector("x", dtype=self.dtype)
         y = np.array([2.0, 3.0], dtype=self.dtype)
         c = iscalar("c")
@@ -284,7 +289,7 @@ class TestIfelse(utt.OptimizationTestMixin):
 
     def test_dtype_mismatch(self):
         rng = np.random.default_rng(utt.fetch_seed())
-        data = rng.random((5)).astype(self.dtype)
+        data = rng.random(5).astype(self.dtype)
         x = self.shared(data)
         y = at.cast(x * 10, "int8")
         cond = iscalar("cond")
@@ -296,7 +301,7 @@ class TestIfelse(utt.OptimizationTestMixin):
 
     def test_ndim_mismatch(self):
         rng = np.random.default_rng(utt.fetch_seed())
-        data = rng.random((5)).astype(self.dtype)
+        data = rng.random(5).astype(self.dtype)
         x = self.shared(data)
         y = col("y", self.dtype)
         cond = iscalar("cond")
@@ -308,7 +313,7 @@ class TestIfelse(utt.OptimizationTestMixin):
 
     def test_broadcast_mismatch(self):
         rng = np.random.default_rng(utt.fetch_seed())
-        data = rng.random((5)).astype(self.dtype)
+        data = rng.random(5).astype(self.dtype)
         x = self.shared(data)
         # print x.broadcastable
         y = row("y", self.dtype)
@@ -320,25 +325,23 @@ class TestIfelse(utt.OptimizationTestMixin):
         with pytest.raises(TypeError):
             ifelse(cond, y, x)
 
-    def test_sparse_tensor_error(self):
-        pytest.importorskip("scipy", minversion="0.7.0")
-
-        import aesara.sparse
+    def test_sparse_conversions(self):
+        from aesara.sparse import matrix
 
         rng = np.random.default_rng(utt.fetch_seed())
         data = rng.random((2, 3)).astype(self.dtype)
         x = self.shared(data)
-        y = aesara.sparse.matrix("csc", dtype=self.dtype, name="y")
-        z = aesara.sparse.matrix("csr", dtype=self.dtype, name="z")
+        y = matrix("csc", dtype=self.dtype, name="y")
+        z = matrix("csr", dtype=self.dtype, name="z")
         cond = iscalar("cond")
 
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(TypeError, match=".*do not match."):
             ifelse(cond, x, y)
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(TypeError, match=".*do not match."):
             ifelse(cond, y, x)
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(TypeError):
             ifelse(cond, x, z)
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(TypeError):
             ifelse(cond, z, x)
         with pytest.raises(TypeError):
             ifelse(cond, y, z)
@@ -504,7 +507,7 @@ class TestIfelse(utt.OptimizationTestMixin):
             aesara.grad(ifelse(0, x, x), x)
 
     def test_grad_int_value(self):
-        w = aesara.shared(np.random.random((10)))
+        w = aesara.shared(np.random.random(10))
         b = aesara.shared(np.random.random())
         params = [w, b]
 
@@ -527,6 +530,38 @@ class TestIfelse(utt.OptimizationTestMixin):
         res.owner.op.as_view = True
         assert str(res.owner).startswith("if{name,inplace}")
 
+    @pytest.mark.parametrize(
+        "x_shape, y_shape, x_val, y_val, exp_shape",
+        [
+            ((2,), (3,), np.r_[1.0, 2.0], np.r_[1.0, 2.0, 3.0], (None,)),
+            ((None,), (3,), np.r_[1.0, 2.0], np.r_[1.0, 2.0, 3.0], (None,)),
+            ((3,), (None,), np.r_[1.0, 2.0, 3.0], np.r_[1.0, 2.0], (None,)),
+            ((2, 1), (None, 1), np.c_[[1.0, 2.0]], np.c_[[1.0, 2.0, 3.0]], (None, 1)),
+            ((3,), (3,), np.r_[1.0, 2.0, 3.0], np.r_[1.0, 2.0, 3.0], (3,)),
+            ((1,), (3,), np.r_[1.0], np.r_[1.0, 2.0, 3.0], (None,)),
+        ],
+    )
+    def test_static_branch_shapes(self, x_shape, y_shape, x_val, y_val, exp_shape):
+        x = at.tensor(dtype=self.dtype, shape=x_shape, name="x")
+        y = at.tensor(dtype=self.dtype, shape=y_shape, name="y")
+        c = iscalar("c")
+        z = IfElse(1)(c, x, y)
+        assert z.type.shape == exp_shape
+
+        f = function([c, x, y], z, mode=self.mode)
+
+        x_val = x_val.astype(self.dtype)
+        y_val = y_val.astype(self.dtype)
+        val = f(0, x_val, y_val)
+        assert np.array_equal(val, y_val)
+
+    def test_nonscalar_condition(self):
+        x = vector("x")
+        y = vector("y")
+        c = ivector("c")
+        with pytest.raises(TypeError, match="The condition argument"):
+            IfElse(1)(c, x, y)
+
 
 class IfElseIfElseIf(Op):
     def __init__(self, inplace=False):
@@ -542,7 +577,6 @@ class IfElseIfElseIf(Op):
         return Apply(self, [c1, t1, c2, t2, c3, t3, f3], [t1.type()])
 
     def make_thunk(self, node, storage_map, compute_map, no_recycling, impl):
-
         input_computed = [compute_map[v] for v in node.inputs]
         output_computed = [compute_map[v] for v in node.outputs]
         input_registers = [storage_map[v] for v in node.inputs]

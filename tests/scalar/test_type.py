@@ -2,9 +2,9 @@ import numpy as np
 
 from aesara.configdefaults import config
 from aesara.scalar.basic import (
-    IntDiv,
+    FloorDivide,
     ScalarType,
-    TrueDiv,
+    TrueDivide,
     complex64,
     float32,
     float64,
@@ -25,15 +25,15 @@ def test_div_types():
     d = float64()
     f = float32()
 
-    assert isinstance((a // b).owner.op, IntDiv)
-    assert isinstance((b // a).owner.op, IntDiv)
-    assert isinstance((b / d).owner.op, TrueDiv)
-    assert isinstance((b / f).owner.op, TrueDiv)
-    assert isinstance((f / a).owner.op, TrueDiv)
-    assert isinstance((d / b).owner.op, TrueDiv)
-    assert isinstance((d / f).owner.op, TrueDiv)
-    assert isinstance((f / c).owner.op, TrueDiv)
-    assert isinstance((a / c).owner.op, TrueDiv)
+    assert isinstance((a // b).owner.op, FloorDivide)
+    assert isinstance((b // a).owner.op, FloorDivide)
+    assert isinstance((b / d).owner.op, TrueDivide)
+    assert isinstance((b / f).owner.op, TrueDivide)
+    assert isinstance((f / a).owner.op, TrueDivide)
+    assert isinstance((d / b).owner.op, TrueDivide)
+    assert isinstance((d / f).owner.op, TrueDivide)
+    assert isinstance((f / c).owner.op, TrueDivide)
+    assert isinstance((a / c).owner.op, TrueDivide)
 
 
 def test_filter_float_subclass():

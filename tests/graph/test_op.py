@@ -52,7 +52,6 @@ class MyType(Type):
 
 
 class MyOp(Op):
-
     __props__ = ()
 
     def make_node(self, *inputs):
@@ -83,7 +82,6 @@ class NoInputOp(Op):
 
 
 class TestOp:
-
     # Sanity tests
     def test_sanity_0(self):
         r1, r2 = MyType(1)(), MyType(2)()
@@ -159,7 +157,6 @@ def test_test_value_shared():
 
 @config.change_flags(compute_test_value="raise")
 def test_test_value_op():
-
     x = log(np.ones((5, 5)))
     v = op.get_test_value(x)
 
@@ -194,7 +191,6 @@ def test_get_test_values_success():
             iters = 0
 
             for x_val, y_val in op.get_test_values(x, y):
-
                 assert x_val.shape == (4,)
                 assert y_val.shape == (5, 5)
 
@@ -223,3 +219,16 @@ def test_op_invalid_input_types():
     msg = r"^Invalid input types for Op.*"
     with pytest.raises(TypeError, match=msg):
         TestOp()(dvector(), dscalar(), dvector())
+
+
+def test_op_input_broadcastable():
+    # Test that we can create an op with a broadcastable subtype as input
+    class SomeOp(aesara.tensor.Op):
+        itypes = [at.dvector]
+        otypes = [at.dvector]
+
+        def perform(self, *_):
+            raise NotImplementedError()
+
+    x = at.TensorType(dtype="float64", shape=(1,))("x")
+    assert SomeOp()(x).type == at.dvector

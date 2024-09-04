@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import aesara
+import aesara.tensor as at
 import tests.unittest_tools as utt
 from aesara.compile.mode import Mode
 from aesara.graph.fg import FunctionGraph
@@ -52,7 +53,7 @@ from aesara.scalar.basic import (
     switch,
     tan,
     tanh,
-    true_div,
+    true_divide,
     uint8,
 )
 from aesara.tensor.type import fscalar, imatrix, iscalar, matrix
@@ -61,7 +62,7 @@ from tests.link.test_link import make_function
 
 def test_mul_add_true():
     x, y, z = floats("xyz")
-    e = mul(add(x, y), true_div(x, y))
+    e = mul(add(x, y), true_divide(x, y))
     g = FunctionGraph([x, y], [e])
     fn = make_function(DualLinker().accept(g))
     assert fn(1.0, 2.0) == 1.5
@@ -107,7 +108,7 @@ class TestComposite:
 
     def test_straightforward(self):
         x, y, z = floats("xyz")
-        e = mul(add(x, y), true_div(x, y))
+        e = mul(add(x, y), true_divide(x, y))
         C = Composite([x, y], [e])
         c = C.make_node(x, y)
         # print c.c_code(['x', 'y'], ['z'], dict(id = 0))
@@ -129,12 +130,17 @@ class TestComposite:
 
     def test_with_constants(self):
         x, y, z = floats("xyz")
-        e = mul(add(70.0, y), true_div(x, y))
-        C = Composite([x, y], [e])
-        c = C.make_node(x, y)
-        assert "70.0" in c.op.c_code(c, "dummy", ["x", "y"], ["z"], dict(id=0))
-        # print c.c_code(['x', 'y'], ['z'], dict(id = 0))
-        g = FunctionGraph([x, y], [c.out])
+        e = mul(add(70.0, y), true_divide(x, y))
+        comp_op = Composite([x, y], [e])
+        comp_node = comp_op.make_node(x, y)
+
+        c_code = comp_node.op.c_code(comp_node, "dummy", ["x", "y"], ["z"], dict(id=0))
+        assert "70.0" in c_code
+
+        # Make sure caching of the c_code template works
+        assert hasattr(comp_node.op, "_c_code")
+
+        g = FunctionGraph([x, y], [comp_node.out])
         fn = make_function(DualLinker().accept(g))
         assert fn(1.0, 2.0) == 36.0
 
@@ -174,24 +180,35 @@ class TestComposite:
             "*1::1, *1::2, *1::3, *1::4, *1::5, *1::6, *1::7)"
         )
 
-    def test_make_node_continue_graph(self):
-        # This is a test for a bug (now fixed) that disabled the
-        # local_gpu_elemwise_0 optimization and printed an
-        # optimization warning on the terminal.
+    def test_non_scalar_error(self):
+        x = float32("x")
+        comp_op = Composite([x], [(at.zeros((2,)) + x).sum()])
 
-        # We test that Composite.make_node accept as inputs Variable
-        # some that represent existing computation.
+        with pytest.raises(TypeError, match=".*exclusively.*ScalarOp.*"):
+            comp_op.fgraph
 
-        si0 = aesara.scalar.int8()
-        si1 = aesara.scalar.int8()
-        si2 = aesara.scalar.float32()
-        sout = (si0 * si1) / si2
-        sop = aesara.scalar.Composite([si0, si1, si2], [sout])
-        si0 = aesara.scalar.int8()
-        si1 = aesara.scalar.int8()
-        si2 = aesara.scalar.float32()
-        si3 = aesara.scalar.float32()
-        sop.make_node(si0 * si3, si1, si2)
+    def test_multi_out_perform(self):
+        from aesara.graph.basic import Apply
+        from aesara.scalar.basic import ScalarOp
+
+        class MultiOutOp(ScalarOp):
+            def make_node(self, x):
+                return Apply(self, [x], [x.type(), x.type()])
+
+            def perform(self, node, inputs, outputs):
+                outputs[1][0] = outputs[0][0] = inputs[0]
+
+            def c_code(self, *args):
+                return "dummy"
+
+        x = float32("x")
+        comp_op = Composite([x], MultiOutOp()(x))
+
+        y, z = comp_op(x)
+
+        fn = aesara.function([x], [y, z], mode=Mode("py", None))
+
+        assert fn(1.0) == [1.0, 1.0]
 
 
 class TestLogical:
@@ -339,8 +356,8 @@ class TestUpgradeToFloat:
                 assert outi.dtype == outf.dtype, "incorrect dtype"
                 assert np.allclose(outi, outf), "insufficient precision"
 
-    def test_true_div(self):
-        # true_div's upcast policy is not exactly "upgrade_to_float",
+    def test_true_divide(self):
+        # true_divide's upcast policy is not exactly "upgrade_to_float",
         # so the test is a little bit different
         x_range = list(range(-127, 128))
         y_range = list(range(-127, 0)) + list(range(1, 127))
@@ -350,10 +367,10 @@ class TestUpgradeToFloat:
         xf = ScalarType(aesara.config.floatX)("xf")
         yf = ScalarType(aesara.config.floatX)("yf")
 
-        ei = true_div(xi, yi)
+        ei = true_divide(xi, yi)
         fi = aesara.function([xi, yi], ei)
 
-        ef = true_div(xf, yf)
+        ef = true_divide(xf, yf)
         ff = aesara.function([xf, yf], ef)
 
         for x_val in x_range:
@@ -392,7 +409,6 @@ def test_grad_gt():
 
 
 def test_grad_switch():
-
     # This is a code snippet from the mailing list
     # It caused an assert to be raised due to the
     # switch op's grad method not handling integer
@@ -444,7 +460,7 @@ def test_grad_inrange():
 
 def test_grad_abs():
     a = fscalar("a")
-    b = aesara.tensor.nnet.relu(a)
+    b = 0.5 * (a + aesara.tensor.abs(a))
     c = aesara.grad(b, a)
     f = aesara.function([a], c, mode=Mode(optimizer=None))
     # Currently Aesara return 0.5, but it isn't sure it won't change
@@ -488,3 +504,63 @@ def test_mean(mode):
     z = mean()
     z_fn = aesara.function([], z, mode=mode)
     assert z_fn() == 0
+
+
+def test_shape():
+    a = float32("a")
+    assert isinstance(a.type, ScalarType)
+    assert a.shape.type.ndim == 1
+    assert a.shape.type.shape == (0,)
+    assert a.shape.type.dtype == "int64"
+
+    b = constant(2, name="b")
+    assert isinstance(b.type, ScalarType)
+    assert b.shape.type.ndim == 1
+    assert b.shape.type.shape == (0,)
+    assert b.shape.type.dtype == "int64"
+
+
+def test_deprecations():
+    """Make sure we can import from deprecated modules."""
+
+    with pytest.deprecated_call():
+        from aesara.scalar.basic import true_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar import true_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar.basic import Inv  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar import Inv  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar.basic import inv  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar import inv  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar.basic import Scalar  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar import Scalar  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar.basic import floor_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar import floor_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar.basic import int_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar import int_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar.basic import sqr  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.scalar import sqr  # noqa: F401 F811

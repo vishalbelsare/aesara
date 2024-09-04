@@ -4,7 +4,7 @@ import pytest
 import aesara
 from aesara.compile.mode import get_default_mode, get_mode
 from aesara.configdefaults import config
-from aesara.graph.opt import check_stack_trace
+from aesara.graph.rewriting.basic import check_stack_trace
 from aesara.scalar.basic import Composite
 from aesara.tensor.elemwise import Elemwise
 from aesara.tensor.inplace import sigmoid_inplace
@@ -112,9 +112,9 @@ class TestSpecialSigmoidOpts:
 
         assert isinstance(topo[0].op, Elemwise)
         assert isinstance(topo[0].op.scalar_op, Composite)
-        assert ultra_fast_scalar_sigmoid in set(
+        assert ultra_fast_scalar_sigmoid in {
             node.op for node in topo[0].op.scalar_op.fgraph.toposort()
-        )
+        }
         assert len(topo) == 1
 
     def test_local_hard_sigmoid(self):

@@ -25,7 +25,6 @@ import aesara
 
 aesara_path = os.path.join(os.path.dirname(__file__), os.pardir)
 sys.path.append(os.path.abspath(aesara_path))
-import versioneer
 
 # General configuration
 # ---------------------
@@ -34,15 +33,18 @@ import versioneer
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
 extensions = [
     "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
     "sphinx.ext.todo",
     "sphinx.ext.doctest",
     "sphinx.ext.napoleon",
     "sphinx.ext.linkcode",
+    "sphinx_design",
 ]
 
 todo_include_todos = True
 napoleon_google_docstring = False
 napoleon_include_special_with_doc = False
+autosummary_generate = True
 
 # We do it like this to support multiple sphinx version without having warning.
 # Our buildbot consider warning as error.
@@ -70,22 +72,16 @@ master_doc = "index"
 
 # General substitutions.
 project = "Aesara"
-copyright = "Aesara Developers, 2021; PyMC Developers, 2020-2021; 2008--2019, LISA lab"
+copyright = "Aesara Developers, 2021-2023; PyMC Developers, 2020-2021; 2008--2019, LISA lab"
 
 # The default replacements for |version| and |release|, also used in various
 # other places throughout the built documents.
 #
 
-# We need this hokey-pokey because versioneer needs the current
-# directory to be the root of the project to work.
-_curpath = os.getcwd()
-os.chdir(os.path.dirname(os.path.dirname(__file__)))
 # The full version, including alpha/beta/rc tags.
-release = versioneer.get_version()
+release = aesara.__version__
 # The short X.Y version.
 version = ".".join(release.split(".")[:2])
-os.chdir(_curpath)
-del _curpath
 
 # There are two options for replacing |today|: either, you set today to some
 # non-false value, then it is used:
@@ -128,19 +124,15 @@ pygments_style = "sphinx"
 # html_style = 'default.css'
 # html_theme = 'sphinxdoc'
 
-# html4_writer added to Fix colon & whitespace misalignment
-# https://github.com/readthedocs/sphinx_rtd_theme/issues/766#issuecomment-513852197
-html4_writer = True
-
 # Read the docs style:
-if os.environ.get("READTHEDOCS") != "True":
-    try:
-        import sphinx_rtd_theme
-    except ImportError:
-        pass  # assume we have sphinx >= 1.3
-    else:
-        html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
-    html_theme = "sphinx_rtd_theme"
+html_theme = "sphinx_book_theme"
+html_theme_options = {
+    "repository_url": "https://github.com/aesara-devs/aesara",
+    "use_repository_button": True,
+    "use_download_button": False,
+}
+html_title = ""
+html_logo = "images/aesara_logo_200.png"
 
 
 def setup(app):
@@ -166,7 +158,7 @@ def setup(app):
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = [".static", "images", "library/d3viz/examples"]
+html_static_path = [".static", "images", "troubleshoot/d3viz/examples"]
 
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.

@@ -1,7 +1,4 @@
-"""
-Driver of graph construction, optimization, and linking.
-
-"""
+"""Objects that orchestrate graph construction, rewriting, and linking."""
 
 import copy
 import copyreg
@@ -9,14 +6,15 @@ import logging
 import time
 import warnings
 from itertools import chain
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Tuple, Type, Union
 
 import numpy as np
 
 import aesara
 import aesara.compile.profiling
-from aesara.compile.io import In, SymbolicInput, SymbolicOutput
-from aesara.compile.ops import deep_copy_op, view_op
+from aesara.compile.io import In, Out, SymbolicInput, SymbolicOutput
+from aesara.compile.ops import deep_copy_op, update_placeholder, view_op
+from aesara.compile.profiling import ProfileStats
 from aesara.configdefaults import config
 from aesara.graph.basic import (
     Constant,
@@ -35,6 +33,7 @@ from aesara.link.utils import raise_with_op
 
 
 if TYPE_CHECKING:
+    from aesara.compile.mode import Mode
     from aesara.link.vm import VM
 
 
@@ -142,31 +141,30 @@ class Supervisor(Feature):
 
     """
 
-    def __init__(self, protected):
-        self.fgraph = None
-        self.protected = list(protected)
-
-    def clone(self):
-        return type(self)(self.protected)
+    def __init__(self, protected: Iterable[Variable]):
+        self.initial_protected = set(protected)
 
     def on_attach(self, fgraph):
-        if hasattr(fgraph, "_supervisor"):
-            raise AlreadyThere(f"A Supervisor is already attached to {fgraph}.")
+        if hasattr(fgraph, "_supervisor_protected"):
+            # Add the protected variables from this `Supervisor` instance, in
+            # case something is trying to update them by adding another
+            # `Supervisor`
+            fgraph._supervisor_protected.update(self.initial_protected)
+            raise AlreadyThere("Supervisor feature is already present")
 
-        if self.fgraph is not None and self.fgraph != fgraph:
-            raise Exception("This Feature is already associated with a FunctionGraph")
+        fgraph._supervisor_protected = set(self.initial_protected)
 
-        fgraph._supervisor = self
-        self.fgraph = fgraph
+    def clone(self):
+        return type(self)(self.initial_protected)
 
     def validate(self, fgraph):
         if config.cycle_detection == "fast" and hasattr(fgraph, "has_destroyers"):
-            if fgraph.has_destroyers(self.protected):
+            if fgraph.has_destroyers(fgraph._supervisor_protected):
                 raise InconsistencyError("Trying to destroy protected variables.")
             return True
         if not hasattr(fgraph, "destroyers"):
             return True
-        for r in self.protected + list(fgraph.outputs):
+        for r in chain(fgraph._supervisor_protected, fgraph.outputs):
             if fgraph.destroyers(r):
                 raise InconsistencyError(f"Trying to destroy a protected variable: {r}")
 
@@ -598,6 +596,7 @@ class Function:
         aesara.Function
             Copied aesara.Function
         """
+
         # helper function
         def checkSV(sv_ori, sv_rpl):
             """
@@ -734,10 +733,10 @@ class Function:
                 message = name
             else:
                 message = str(profile.message) + " copy"
-            profile = aesara.compile.profiling.ProfileStats(message=message)
+            profile = ProfileStats(message=message)
             # profile -> object
         elif isinstance(profile, str):
-            profile = aesara.compile.profiling.ProfileStats(message=profile)
+            profile = ProfileStats(message=profile)
 
         f_cpy = maker.__class__(
             inputs=ins,
@@ -753,9 +752,8 @@ class Function:
             # cause problems.
             on_unused_input="ignore",
             function_builder=maker.function_builder,
-            # As this is an optimized graph, it
-            # can contain inplace. DebugMode check
-            # that.
+            # As this is an rewritten graph, it can contain inplace. DebugMode
+            # check that.
             accept_inplace=True,
             no_fgraph_prep=True,
         ).create(input_storage, storage_map=new_storage_map)
@@ -763,7 +761,6 @@ class Function:
         for in_ori, in_cpy, ori, cpy in zip(
             maker.inputs, f_cpy.maker.inputs, self.input_storage, f_cpy.input_storage
         ):
-
             # Share immutable ShareVariable and constant input's storage
             swapped = swap is not None and in_ori.variable in swap
 
@@ -828,7 +825,7 @@ class Function:
                     self[i] = value
 
         profile = self.profile
-        t0 = time.time()
+        t0 = time.perf_counter()
 
         output_subset = kwargs.pop("output_subset", None)
         if output_subset is not None and self.output_keys is not None:
@@ -913,7 +910,6 @@ class Function:
                 if hasattr(i_var.type, "may_share_memory"):
                     is_aliased = False
                     for j in range(len(args_share_memory)):
-
                         group_j = zip(
                             [
                                 self.maker.inputs[k].variable
@@ -931,7 +927,6 @@ class Function:
                             )
                             for (var, val) in group_j
                         ):
-
                             is_aliased = True
                             args_share_memory[j].append(i)
                             break
@@ -969,7 +964,7 @@ class Function:
                     )
 
         # Do the actual work
-        t0_fn = time.time()
+        t0_fn = time.perf_counter()
         try:
             outputs = (
                 self.vm()
@@ -995,7 +990,7 @@ class Function:
                 # old-style linkers raise their own exceptions
                 raise
 
-        dt_fn = time.time() - t0_fn
+        dt_fn = time.perf_counter() - t0_fn
         self.maker.mode.fn_time += dt_fn
         if profile:
             profile.vm_call_time += dt_fn
@@ -1043,7 +1038,7 @@ class Function:
         #       grep for 'PROFILE_CODE'
         #
 
-        dt_call = time.time() - t0
+        dt_call = time.perf_counter() - t0
         aesara.compile.profiling.total_fct_exec_time += dt_call
         self.maker.mode.call_time += dt_call
         if profile:
@@ -1059,9 +1054,7 @@ class Function:
         elif self.unpack_single and len(outputs) == 1 and output_subset is None:
             return outputs[0]
         else:
-
             if self.output_keys is not None:
-
                 assert len(self.output_keys) == len(outputs)
 
                 if output_subset is None:
@@ -1182,7 +1175,7 @@ def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
     This loop was inserted to remove aliasing between outputs when they all
     evaluate to the same value. Originally it was OK for outputs to be aliased,
     but some of the outputs can be shared variables, and is not good for shared
-    variables to be aliased. It might be possible to optimize this by making
+    variables to be aliased. It might be possible to rewrite this by making
     sure there is no aliasing only between shared variables.
 
     If some outputs are constant, we add deep copy to respect the memory
@@ -1279,7 +1272,7 @@ class FunctionMaker:
     """
     `FunctionMaker` is the class to `create` `Function` instances.
 
-    This class has the fgraph, the optimizer, and the linker. When
+    This class has the fgraph, the rewriter, and the linker. When
     copying a `Function`, there is no need to duplicate the
     `FunctionMaker` instance. Deepcopy still copies both, which can
     variable in re-compilation.
@@ -1292,7 +1285,7 @@ class FunctionMaker:
         functions produced by FunctionMaker will return their output value
         directly.
     mode : Mode instance
-        Telling FunctionMaker how to optimize and link. None means to use the
+        Telling FunctionMaker how to rewrite and link. None means to use the
         `config.mode`.
     accept_inplace : bool
         True iff it is acceptable to have inplace operations in the graph from
@@ -1395,44 +1388,106 @@ class FunctionMaker:
 
     @staticmethod
     def prepare_fgraph(
-        inputs, outputs, additional_outputs, fgraph, optimizer, linker, profile
+        inputs: List[In],
+        outputs: List[Out],
+        additional_outputs: List[Out],
+        fgraph: FunctionGraph,
+        mode: "Mode",
+        profile: Union[Optional[ProfileStats], Literal[False]],
     ):
+        r"""Perform rewrites on a graph, insert `DeepCopyOp`\s, and remove unused updates.
+
+        .. warning::
+
+            The `additional_outputs` list and `fgraph.outputs` are updated in-place by this method.
+
+        Parameters
+        ==========
+        inputs
+            The wrapped inputs.
+        outputs
+            The wrapped outputs (i.e. wrapped with `Out`).
+        additional_outputs
+            Output graphs that essentially serve as updates to mutable `inputs`.
+        fgraph
+            The `FunctionGraph` to be prepared.
+        mode
+            The `Mode` that determines--for example--which rewrites are applied.
+        profile
+            The profile object/setting to use.
+
+        """
+
+        rewriter = mode.optimizer
 
         try:
-            start_optimizer = time.time()
+            start_rewriter = time.perf_counter()
 
-            optimizer_profile = None
-            opt_time = None
+            rewriter_profile = None
+            rewrite_time = None
 
             with config.change_flags(
+                mode=mode,
                 compute_test_value=config.compute_test_value_opt,
                 traceback__limit=config.traceback__compile_limit,
             ):
-                optimizer_profile = optimizer(fgraph)
+                rewriter_profile = rewriter(fgraph)
 
-                end_optimizer = time.time()
-                opt_time = end_optimizer - start_optimizer
-                _logger.debug(f"Optimizing took {opt_time:f} seconds")
+                end_rewriter = time.perf_counter()
+                rewrite_time = end_rewriter - start_rewriter
+                _logger.debug(f"Rewriting took {rewrite_time:f} seconds")
+
+                fgraph_outputs = tuple(fgraph.outputs)
+                update_mappings = tuple(fgraph.update_mapping.items())
+                outputs_to_remove = []
+                additional_outputs_to_remove = []
+
+                # Remove unused updates
+                for i, (out_idx, in_idx) in enumerate(update_mappings):
+                    update = fgraph_outputs[out_idx]
+
+                    if update.owner and update.owner.op == update_placeholder:
+                        # TODO: Consider removing the corresponding
+                        # `FunctionGraph` input when it has no other
+                        # references?
+                        # updated_var = fgraph_inputs[in_idx]
+                        # if not fgraph.clients[updated_var]:
+                        #     fgraph.remove_input(updated_var)
+
+                        # Remove the update entry from the wrapped inputs
+                        inputs[in_idx].update = None
+
+                        # We assume that the orders of `fgraph.update_mapping` and
+                        # `additional_outputs` correspond (and they should)
+                        additional_outputs_to_remove.append(additional_outputs[i])
+
+                        outputs_to_remove.append(fgraph.outputs[out_idx])
+
+                for add_out, out in zip(
+                    additional_outputs_to_remove, outputs_to_remove
+                ):
+                    additional_outputs.remove(add_out)
+                    fgraph_out_idx = fgraph.outputs.index(out)
+                    fgraph.remove_output(fgraph_out_idx)
 
                 # Add deep copy to respect the memory interface
                 insert_deepcopy(fgraph, inputs, outputs + additional_outputs)
         finally:
+            # If the rewriter got interrupted
+            if rewrite_time is None:
+                end_rewriter = time.perf_counter()
+                rewrite_time = end_rewriter - start_rewriter
 
-            # If the optimizer got interrupted
-            if opt_time is None:
-                end_optimizer = time.time()
-                opt_time = end_optimizer - start_optimizer
-
-            aesara.compile.profiling.total_graph_opt_time += opt_time
+            aesara.compile.profiling.total_graph_rewrite_time += rewrite_time
 
             if profile:
-                if optimizer_profile is None and hasattr(optimizer, "pre_profile"):
-                    optimizer_profile = optimizer.pre_profile
+                if rewriter_profile is None and hasattr(rewriter, "pre_profile"):
+                    rewriter_profile = rewriter.pre_profile
 
-                profile.optimizer_time += opt_time
+                profile.rewriting_time += rewrite_time
 
                 if config.profile_optimizer:
-                    profile.optimizer_profile = (optimizer, optimizer_profile)
+                    profile.rewriter_profile = (rewriter, rewriter_profile)
             elif config.profile_optimizer and profile is not False:
                 # If False, it means the profiling for that function was
                 # explicitly disabled
@@ -1444,7 +1499,7 @@ class FunctionMaker:
                     stacklevel=3,
                 )
 
-        if not hasattr(linker, "accept"):
+        if not hasattr(mode.linker, "accept"):
             raise ValueError(
                 "'linker' parameter of FunctionMaker should be "
                 f"a Linker with an accept method or one of {list(aesara.compile.mode.predefined_linkers.keys())}"
@@ -1466,8 +1521,8 @@ class FunctionMaker:
     ):
         # Save the provided mode, not the instantiated mode.
         # The instantiated mode don't pickle and if we unpickle an Aesara
-        # function and it get re-compiled, we want the current optimizer to be
-        # used, not the optimizer when it was saved.
+        # function and it get re-compiled, we want the current rewriter to be
+        # used, not the rewriter when it was saved.
         self.mode = mode
         mode = aesara.compile.mode.get_mode(mode)
 
@@ -1478,7 +1533,7 @@ class FunctionMaker:
         if profile:
             # This is very important:
             # 1) We preload the cache here to not have its timing
-            #    included in optimization that compile function.
+            #    included with the rewrites.
             # 2) Do not refresh the cache here by default. It cause
             #    too much execution time during testing as we compile
             #    much more functions then the number of compile c
@@ -1515,12 +1570,8 @@ class FunctionMaker:
 
         self.fgraph = fgraph
 
-        optimizer, linker = mode.optimizer, copy.copy(mode.linker)
-
         if not no_fgraph_prep:
-            self.prepare_fgraph(
-                inputs, outputs, found_updates, fgraph, optimizer, linker, profile
-            )
+            self.prepare_fgraph(inputs, outputs, found_updates, fgraph, mode, profile)
 
         assert len(fgraph.outputs) == len(outputs + found_updates)
 
@@ -1531,6 +1582,8 @@ class FunctionMaker:
             for output, spec in zip(fgraph.outputs, outputs + found_updates)
             if not spec.borrow
         ]
+
+        linker = copy.copy(mode.linker)
 
         if no_borrow:
             self.linker = linker.accept(
@@ -1598,7 +1651,6 @@ class FunctionMaker:
         for i, ((input, indices, subinputs), input_storage_i) in enumerate(
             zip(self.indices, input_storage)
         ):
-
             # Replace any default value given as a variable by its
             # container.  Note that this makes sense only in the
             # context of shared variables, but for now we avoid
@@ -1649,7 +1701,7 @@ class FunctionMaker:
             defaults.append((required, refeed, storage))
 
         # Get a function instance
-        start_linker = time.time()
+        start_linker = time.perf_counter()
         start_import_time = aesara.link.c.cmodule.import_time
 
         with config.change_flags(traceback__limit=config.traceback__compile_limit):
@@ -1657,7 +1709,7 @@ class FunctionMaker:
                 input_storage=input_storage_lists, storage_map=storage_map
             )
 
-        end_linker = time.time()
+        end_linker = time.perf_counter()
 
         linker_time = end_linker - start_linker
         aesara.compile.profiling.total_time_linker += linker_time
@@ -1715,7 +1767,7 @@ def orig_function(
         time spent in this function.
     accept_inplace : bool
         True iff the graph can contain inplace operations prior to the
-        optimization phase (default is False).
+        rewrite phase (default is False).
     profile : None or ProfileStats instance
     on_unused_input : {'raise', 'warn', 'ignore', None}
         What to do if a variable in the 'inputs' list is not used in the graph.
@@ -1729,7 +1781,7 @@ def orig_function(
 
     """
 
-    t1 = time.time()
+    t1 = time.perf_counter()
     mode = aesara.compile.mode.get_mode(mode)
 
     inputs = list(map(convert_function_input, inputs))
@@ -1762,7 +1814,7 @@ def orig_function(
         with config.change_flags(compute_test_value="off"):
             fn = m.create(defaults)
     finally:
-        t2 = time.time()
+        t2 = time.perf_counter()
         if fn and profile:
             profile.compile_time += t2 - t1
             # TODO: append

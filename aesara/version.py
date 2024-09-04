@@ -1,27 +1,30 @@
-from aesara._version import get_versions
-
-FALLBACK_VERSION = "1.0.5+unknown"
-
-info = get_versions()
-if info["error"] is not None:
-    info["version"] = FALLBACK_VERSION
-
-full_version = info["version"]
-git_revision = info["full-revisionid"]
-del get_versions
-
-short_version = full_version.split("+")[0]
-
-
-# This tries to catch a tag like beta2, rc1, ...
 try:
-    int(short_version.split(".")[2])
-    release = True
-except (ValueError, IndexError):
-    release = False
+    from aesara._version import __version__ as version
+except ImportError:
+    raise RuntimeError(
+        "Unable to find the version number that is generated when either building or "
+        "installing from source. Please make sure that this Aesara has been properly "
+        "installed, e.g. with\n\n  pip install -e .\n"
+    )
 
-if release and info["error"] is None:
-    version = short_version
-else:
-    version = full_version
-del info
+deprecated_names = [
+    "FALLBACK_VERSION",
+    "full_version",
+    "git_revision",
+    "short_version",
+    "release",
+]
+
+
+def __getattr__(name):
+    # (Called when the module attribute is not found.)
+    if name in deprecated_names:
+        raise RuntimeError(
+            f"{name} was deprecated when migrating away from versioneer. If you "
+            f"need it, please search for or open an issue on GitHub entitled "
+            f"'Restore deprecated versioneer variable {name}'.",
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = ["version"]

@@ -113,12 +113,12 @@ def test_speed():
         x = np.asarray([2.0, 3.0], dtype=config.floatX)
 
         numpy_version(x, steps_a)
-        t0 = time.time()
+        t0 = time.perf_counter()
         # print numpy_version(x, steps_a)
-        t1 = time.time()
-        t2 = time.time()
+        t1 = time.perf_counter()
+        t2 = time.perf_counter()
         # print numpy_version(x, steps_b)
-        t3 = time.time()
+        t3 = time.perf_counter()
         t_a = t1 - t0
         t_b = t3 - t2
 
@@ -135,15 +135,15 @@ def test_speed():
         f_b = function([x], b, mode=Mode(optimizer=None, linker=linker()))
 
         f_a([2.0, 3.0])
-        t0 = time.time()
+        t0 = time.perf_counter()
         f_a([2.0, 3.0])
-        t1 = time.time()
+        t1 = time.perf_counter()
 
         f_b([2.0, 3.0])
 
-        t2 = time.time()
+        t2 = time.perf_counter()
         f_b([2.0, 3.0])
-        t3 = time.time()
+        t3 = time.perf_counter()
 
         t_a = t1 - t0
         t_b = t3 - t2
@@ -185,15 +185,15 @@ def test_speed_lazy(linker):
     f_b = function([x], b, mode=Mode(optimizer=None, linker=linker))
 
     f_a([2.0])
-    t0 = time.time()
+    t0 = time.perf_counter()
     f_a([2.0])
-    t1 = time.time()
+    t1 = time.perf_counter()
 
     f_b([2.0])
 
-    t2 = time.time()
+    t2 = time.perf_counter()
     f_b([2.0])
-    t3 = time.time()
+    t3 = time.perf_counter()
 
     t_a = t1 - t0
     t_b = t3 - t2
@@ -205,7 +205,6 @@ def test_speed_lazy(linker):
     "linker", [VMLinker(allow_partial_eval=True, use_cloop=False), "cvm"]
 )
 def test_partial_function(linker):
-
     x = scalar("input")
     y = x**2
     f = function(
@@ -291,7 +290,6 @@ def test_allow_gc_cvm():
 
 
 class RunOnce(Op):
-
     __props__ = ("nb_run",)
 
     def __init__(self):
@@ -361,7 +359,6 @@ def test_no_recycling():
         VMLinker(use_cloop=False, lazy=False, allow_gc=True),
         VMLinker(use_cloop=False, lazy=False, allow_gc=False),
     ]:
-
         mode = Mode(optimizer="fast_compile", linker=lnk)
         f = function([x], x + 1, mode=mode)
         f2 = function([x], (x + 1) * 2, mode=mode)
@@ -389,7 +386,6 @@ def test_VMLinker_make_vm_no_cvm():
     from unittest.mock import patch
 
     with config.change_flags(cxx=""):
-
         # Make sure that GXX isn't present
         with pytest.raises(MissingGXX):
             import aesara.link.c.cvm
@@ -441,7 +437,6 @@ def test_VM_exception():
 
 
 def test_Loop_exception():
-
     a = scalar()
     fg = FunctionGraph(outputs=[SomeOp()(a)])
 
@@ -472,7 +467,6 @@ def test_Loop_exception():
 
 
 def test_Loop_updates():
-
     a = scalar("a")
     a_plus_1 = a + 1
     fg = FunctionGraph(outputs=[a, a_plus_1], clone=False)
@@ -512,7 +506,6 @@ def test_Loop_updates():
 
 
 def test_Stack_updates():
-
     a = scalar("a")
     a_plus_1 = a + 1
     fg = FunctionGraph(outputs=[a, a_plus_1], clone=False)

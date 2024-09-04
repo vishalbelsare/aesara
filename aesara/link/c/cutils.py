@@ -96,7 +96,8 @@ try:
             assert e.errno == errno.EEXIST
             assert os.path.exists(location), location
     if not os.path.exists(os.path.join(location, "__init__.py")):
-        open(os.path.join(location, "__init__.py"), "w").close()
+        with open(os.path.join(location, "__init__.py"), "w"):
+            pass
 
     try:
         from cutils_ext.cutils_ext import *  # noqa
@@ -111,7 +112,6 @@ try:
                 # and when we receive the lock
                 from cutils_ext.cutils_ext import *  # noqa
             except ImportError:
-
                 compile_cutils()
                 from cutils_ext.cutils_ext import *  # noqa
 finally:

@@ -25,7 +25,7 @@ from aesara.compile import optdb
 from aesara.configdefaults import config
 from aesara.gradient import undefined_grad
 from aesara.graph.basic import Apply, Constant, Variable
-from aesara.graph.opt import in2out, local_optimizer
+from aesara.graph.rewriting.basic import in2out, node_rewriter
 from aesara.link.c.op import COp, Op
 from aesara.link.c.params_type import ParamsType
 from aesara.sandbox import multinomial
@@ -35,6 +35,14 @@ from aesara.tensor import as_tensor_variable, cast, get_vector_length
 from aesara.tensor.math import cos, log, prod, sin, sqrt
 from aesara.tensor.shape import reshape
 from aesara.tensor.type import TensorType, iscalar, ivector, lmatrix
+
+
+warnings.warn(
+    "The module `aesara.sandbox.rng_mrg` is deprecated. "
+    "Use the module `aesara.tensor.random` for random variables instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 
 def matVecModM(A, s, m):
@@ -371,20 +379,23 @@ class mrg_uniform(COp, mrg_uniform_base):
         # this op should not be called directly.
         #
         # call through MRG_RandomStream instead.
-        broad = []
+        out_shape = ()
         for i in range(self.output_type.ndim):
-            broad.append(at.extract_constant(size[i]) == 1)
-        output_type = self.output_type.clone(shape=broad)()
+            if at.extract_constant(size[i]) == 1:
+                out_shape += (1,)
+            else:
+                out_shape += (None,)
+        output_var = self.output_type.clone(shape=out_shape)()
         rstate = as_tensor_variable(rstate)
         size = as_tensor_variable(size)
-        return Apply(self, [rstate, size], [rstate.type(), output_type])
+        return Apply(self, [rstate, size], [rstate.type(), output_var])
 
     @classmethod
     def new(cls, rstate, ndim, dtype, size):
         v_size = as_tensor_variable(size)
         if ndim is None:
             ndim = get_vector_length(v_size)
-        op = cls(TensorType(dtype, (False,) * ndim))
+        op = cls(TensorType(dtype, shape=(None,) * ndim))
         return op(rstate, v_size)
 
     def perform(self, node, inp, out, params):
@@ -1107,10 +1118,10 @@ class MRG_RandomStream:
         **kwargs,
     ):
         warnings.warn(
-            "MRG_RandomStream.multinomial_wo_replacement is "
-            "deprecated and will be removed in the next release of "
-            "Aesara. Please use MRG_RandomStream.choice instead.",
+            "`MRG_RandomStream.multinomial_wo_replacement` is "
+            "deprecated; use `MRG_RandomStream.choice` instead.",
             DeprecationWarning,
+            stacklevel=2,
         )
         assert size is None
         return self.choice(
@@ -1343,9 +1354,8 @@ def _check_size(size):
     return at.as_tensor_variable(size, ndim=1)
 
 
-@local_optimizer((mrg_uniform_base,))
+@node_rewriter((mrg_uniform_base,))
 def mrg_random_make_inplace(fgraph, node):
-
     op = node.op
     if isinstance(op, mrg_uniform_base) and not op.inplace:
         # op might be gpu version

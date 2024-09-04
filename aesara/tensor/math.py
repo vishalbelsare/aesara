@@ -1,5 +1,6 @@
 import builtins
 import warnings
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
 import numpy as np
 
@@ -21,20 +22,16 @@ from aesara.tensor.basic import (
     cast,
     concatenate,
     constant,
-    patternbroadcast,
+    get_scalar_constant_value,
     stack,
     switch,
 )
-from aesara.tensor.elemwise import (
-    CAReduce,
-    CAReduceDtype,
-    DimShuffle,
-    Elemwise,
-    scalar_elemwise,
-)
-from aesara.tensor.shape import shape
+from aesara.tensor.elemwise import CAReduce, DimShuffle, Elemwise, scalar_elemwise
+from aesara.tensor.exceptions import NotScalarConstantError
+from aesara.tensor.shape import shape, specify_broadcastable
 from aesara.tensor.type import (
     DenseTensorType,
+    TensorType,
     complex_dtypes,
     continuous_dtypes,
     discrete_dtypes,
@@ -45,8 +42,13 @@ from aesara.tensor.type import (
 )
 from aesara.tensor.type_other import NoneConst
 from aesara.tensor.utils import as_list
-from aesara.tensor.var import TensorConstant, _tensor_py_operators
+from aesara.tensor.var import TensorConstant
 
+
+if TYPE_CHECKING:
+    from numpy.typing import ArrayLike, DTypeLike
+
+    from aesara.tensor.var import TensorVariable
 
 # We capture the builtins that we are going to replace to follow the numpy API
 _abs = builtins.abs
@@ -147,13 +149,15 @@ class MaxAndArgmax(COp):
         # We keep the original broadcastable flags for dimensions on which
         # we do not perform the max / argmax.
         all_axes = set(self.axis)
-        broadcastable = [
-            b for i, b in enumerate(x.type.broadcastable) if i not in all_axes
-        ]
         inputs = [x]
+        out_shape = tuple(
+            1 if s == 1 else None
+            for i, s in enumerate(x.type.shape)
+            if i not in all_axes
+        )
         outputs = [
-            tensor(x.type.dtype, broadcastable, name="max"),
-            tensor("int64", broadcastable, name="argmax"),
+            tensor(x.type.dtype, shape=out_shape, name="max"),
+            tensor("int64", shape=out_shape, name="argmax"),
         ]
         return Apply(self, inputs, outputs)
 
@@ -371,10 +375,8 @@ class Argmax(COp):
 
         # We keep the original broadcastable flags for dimensions on which
         # we do not perform the argmax.
-        broadcastable = [
-            b for i, b in enumerate(x.type.broadcastable) if i not in all_axes
-        ]
-        outputs = [tensor("int64", broadcastable, name="argmax")]
+        out_shape = tuple(s for i, s in enumerate(x.type.shape) if i not in all_axes)
+        outputs = [tensor("int64", shape=out_shape, name="argmax")]
         return Apply(self, inputs, outputs)
 
     def prepare_node(self, node, storage_map, compute_map, impl):
@@ -629,12 +631,20 @@ class Max(NonZeroCAReduce):
     def __init__(self, axis):
         super().__init__(aes.scalar_maximum, axis)
 
+    def clone(self, **kwargs):
+        axis = kwargs.get("axis", self.axis)
+        return type(self)(axis=axis)
+
 
 class Min(NonZeroCAReduce):
     nfunc_spec = ("min", 1, 1)
 
     def __init__(self, axis):
         super().__init__(aes.scalar_minimum, axis)
+
+    def clone(self, **kwargs):
+        axis = kwargs.get("axis", self.axis)
+        return type(self)(axis=axis)
 
 
 def max(x, axis=None, keepdims=False):
@@ -1044,10 +1054,6 @@ def abs(a):
     """|`a`|"""
 
 
-# These are deprecated and will be removed
-abs_ = abs
-
-
 pprint.assign(abs, printing.PatternPrinter(("|%(0)s|", -1000)))
 
 
@@ -1074,10 +1080,6 @@ def neg(a):
 @scalar_elemwise
 def reciprocal(a):
     """1.0/a"""
-
-
-# This is deprecated and will be removed
-inv = reciprocal
 
 
 @scalar_elemwise
@@ -1156,12 +1158,8 @@ def round_half_away_from_zero(a):
 
 
 @scalar_elemwise
-def sqr(a):
+def square(a):
     """square of a"""
-
-
-# alias to sqr, included to maintain similarity with numpy interface
-square = sqr
 
 
 def cov(m, y=None, rowvar=True, bias=False, ddof=None, fweights=None, aweights=None):
@@ -1336,6 +1334,11 @@ def erfcinv(a):
 
 
 @scalar_elemwise
+def owens_t(h, a):
+    """owens t function"""
+
+
+@scalar_elemwise
 def gamma(a):
     """gamma function"""
 
@@ -1384,6 +1387,16 @@ def gammal(k, x):
 
 
 @scalar_elemwise
+def hyp2f1(a, b, c, z):
+    """Gaussian hypergeometric function."""
+
+
+@scalar_elemwise
+def hyp2f1_der(a, b, c, z):
+    """Derivatives for Gaussian hypergeometric function."""
+
+
+@scalar_elemwise
 def j0(x):
     """Bessel function of the first kind of order 0."""
 
@@ -1415,7 +1428,7 @@ def iv(v, x):
 
 @scalar_elemwise
 def sigmoid(x):
-    """Logistic sigmoid function (1 / (1 + exp(x)), also known as expit or inverse logit"""
+    """Logistic sigmoid function (1 / (1 + exp(-x)), also known as expit or inverse logit"""
 
 
 expit = sigmoid
@@ -1444,15 +1457,9 @@ def real(z):
     """Return real component of complex-valued tensor `z`"""
 
 
-_tensor_py_operators.real = property(real)
-
-
 @scalar_elemwise
 def imag(z):
     """Return imaginary component of complex-valued tensor `z`"""
-
-
-_tensor_py_operators.imag = property(imag)
 
 
 @scalar_elemwise
@@ -1465,9 +1472,19 @@ def complex(real, imag):
     """Return complex-valued tensor with `real` and `imag` components"""
 
 
-@scalar_elemwise
-def conj(z):
+@scalar_elemwise(symbolname="conj")
+def _conj(z):
     """Return the complex conjugate of `z`."""
+
+
+def conjugate(x):
+    _x = as_tensor_variable(x)
+    if _x.type.dtype not in complex_dtypes:
+        return _x
+    return _conj(_x)
+
+
+conj = conjugate
 
 
 @scalar_elemwise
@@ -1505,7 +1522,6 @@ class Mean(CAReduce):
         output[0] = np.asarray(np.mean(input, dtype="float64", axis=axis))
 
     def c_code(self, node, name, inames, onames, sub):
-
         ret = super().c_code(node, name, inames, onames, sub)
 
         if self.axis is not None:
@@ -1518,6 +1534,10 @@ class Mean(CAReduce):
   *((double *)PyArray_DATA({onames[0]})) /= PyArray_SIZE({inames[0]});
   """
         )
+
+    def clone(self, **kwargs):
+        axis = kwargs.get("axis", self.axis)
+        return type(self)(axis=axis)
 
 
 # TODO: implement the grad. When done and tested, you can make this the default
@@ -1587,7 +1607,7 @@ def mean(input, axis=None, dtype=None, op=False, keepdims=False, acc_dtype=None)
 
     # Cast shp into a float type
     # TODO Once we have a consistent casting policy, we could simply
-    # use true_div.
+    # use true_divide.
     if s.dtype in ("float16", "float32", "complex64"):
         shp = cast(shp, "float32")
     else:
@@ -1604,7 +1624,7 @@ def mean(input, axis=None, dtype=None, op=False, keepdims=False, acc_dtype=None)
 
     # This sequential division will possibly be optimized by Aesara:
     for i in axis:
-        s = true_div(s, shp[i])
+        s = true_divide(s, shp[i])
 
     # This can happen when axis is an empty list/tuple
     if s.dtype != shp.dtype and s.dtype in discrete_dtypes:
@@ -1668,7 +1688,7 @@ def var(input, axis=None, ddof=0, keepdims=False, corrected=False):
     # center the input
     centered_input = input - mean_input
 
-    # return the mean sqr
+    # return the mean square
     two = constant(2, dtype=centered_input.dtype)
     if ddof == 0:
         v = mean((centered_input**two), axis, keepdims=keepdims)
@@ -1676,7 +1696,7 @@ def var(input, axis=None, ddof=0, keepdims=False, corrected=False):
         shp = shape(input) - ddof
         v = sum((centered_input**two), axis=axis, keepdims=keepdims)
         for i in axis:
-            v = true_div(v, shp[i])
+            v = true_divide(v, shp[i])
 
     # use 'corrected_two_pass' algorithm
     if corrected:
@@ -1687,7 +1707,7 @@ def var(input, axis=None, ddof=0, keepdims=False, corrected=False):
             shp_inp = shape(input)
             error = sum(centered_input, axis=axis, keepdims=keepdims) ** 2
             for i in axis:
-                error = true_div(error, shp[i] * shp_inp[i])
+                error = true_divide(error, shp[i] * shp_inp[i])
         v = v - error
 
     v.name = "var"
@@ -1750,8 +1770,8 @@ def minimum(x, y):
 
 
 def divmod(x, y):
-    """elementvise divmod, using floor_div and mod_check"""
-    return floor_div(x, y), mod_check(x, y)
+    """Element-wise `divmod`, using `floor_divide` and `mod_check`."""
+    return floor_divide(x, y), mod_check(x, y)
 
 
 @scalar_elemwise
@@ -1773,19 +1793,15 @@ def mul(a, *other_terms):
 
 
 @scalar_elemwise
-def true_div(a, b):
+def true_divide(a, b):
     """elementwise [true] division (inverse of multiplication)"""
     # see decorator for function body
 
 
 @scalar_elemwise
-def int_div(a, b):
+def floor_divide(a, b):
     """elementwise [floor] division (inverse of multiplication)"""
     # see decorator for function body
-
-
-# floor_div and int_div are the same thing
-floor_div = int_div
 
 
 def ceil_intdiv(a, b):
@@ -1803,7 +1819,7 @@ def ceil_intdiv(a, b):
 
     # We cast for the case when a and b are uint*; otherwise, neq will
     # force their upcast to int.
-    div = int_div(a, b)
+    div = floor_divide(a, b)
     ret = cast(neq(a % b, 0), div.dtype) + div
     assert ret.dtype == aes.upcast(
         div.owner.inputs[0].type.dtype, div.owner.inputs[1].type.dtype
@@ -1855,8 +1871,8 @@ pprint.assign(add, printing.OperatorPrinter("+", -2, "either"))
 pprint.assign(mul, printing.OperatorPrinter("*", -1, "either"))
 pprint.assign(sub, printing.OperatorPrinter("-", -2, "left"))
 pprint.assign(neg, printing.OperatorPrinter("-", 0, "either"))
-pprint.assign(true_div, printing.OperatorPrinter("/", -1, "left"))
-pprint.assign(int_div, printing.OperatorPrinter("//", -1, "left"))
+pprint.assign(true_divide, printing.OperatorPrinter("/", -1, "left"))
+pprint.assign(floor_divide, printing.OperatorPrinter("//", -1, "left"))
 pprint.assign(pow, printing.OperatorPrinter("**", 1, "right"))
 
 
@@ -1900,15 +1916,14 @@ class Dot(Op):
                 "aesara.tensor.dot instead."
             )
 
-        i_broadcastables = [input.type.broadcastable for input in inputs]
-        bx, by = i_broadcastables
-        if len(by) == 2:  # y is a matrix
-            bz = bx[:-1] + by[-1:]
-        elif len(by) == 1:  # y is vector
-            bz = bx[:-1]
+        sx, sy = (input.type.shape for input in inputs)
+        if len(sy) == 2:
+            sz = sx[:-1] + sy[-1:]
+        elif len(sy) == 1:
+            sz = sx[:-1]
 
         i_dtypes = [input.type.dtype for input in inputs]
-        outputs = [tensor(aes.upcast(*i_dtypes), bz)]
+        outputs = [tensor(aes.upcast(*i_dtypes), shape=sz)]
         return Apply(self, inputs, outputs)
 
     def perform(self, node, inp, out):
@@ -1921,7 +1936,6 @@ class Dot(Op):
         z[0] = np.asarray(np.dot(x, y))
 
     def grad(self, inp, grads):
-
         x, y = inp
         (gz,) = grads
         xdim, ydim, gdim = x.type.ndim, y.type.ndim, gz.type.ndim
@@ -1951,9 +1965,13 @@ class Dot(Op):
         # above code don't always return the right broadcast pattern.
         # This cause problem down the road. See gh-1461.
         if xgrad.broadcastable != x.broadcastable:
-            xgrad = patternbroadcast(xgrad, x.broadcastable)
+            xgrad = specify_broadcastable(
+                xgrad, *(ax for (ax, b) in enumerate(x.type.broadcastable) if b)
+            )
         if ygrad.broadcastable != y.broadcastable:
-            ygrad = patternbroadcast(ygrad, y.broadcastable)
+            ygrad = specify_broadcastable(
+                ygrad, *(ax for (ax, b) in enumerate(y.type.broadcastable) if b)
+            )
 
         rval = xgrad, ygrad
 
@@ -2168,7 +2186,11 @@ def _tensordot_as_dot(a, b, axes, dot, batched):
         out = out_reshaped.reshape(outshape, outndim)
         # Make sure the broadcastable pattern of the result is correct,
         # since some shape information can be lost in the reshapes.
-        return patternbroadcast(out, outbcast)
+        if out.type.broadcastable != outbcast:
+            out = specify_broadcastable(
+                out, *(ax for (ax, b) in enumerate(outbcast) if b)
+            )
+        return out
 
     # if 'axes' is a list, transpose a and b such that the summed axes of a
     # are last and the summed axes of b are first.
@@ -2332,7 +2354,6 @@ class All(CAReduce):
 
     """
 
-    __props__ = ("axis",)
     nfunc_spec = ("all", 1, 1)
 
     def __init__(self, axis=None):
@@ -2358,6 +2379,10 @@ class All(CAReduce):
         (x,) = inp
         return [x.zeros_like(config.floatX)]
 
+    def clone(self, **kwargs):
+        axis = kwargs.get("axis", self.axis)
+        return type(self)(axis=axis)
+
 
 class Any(CAReduce):
     """Applies `bitwise or` to all the values of a tensor along the
@@ -2365,7 +2390,6 @@ class Any(CAReduce):
 
     """
 
-    __props__ = ("axis",)
     nfunc_spec = ("any", 1, 1)
 
     def __init__(self, axis=None):
@@ -2391,48 +2415,31 @@ class Any(CAReduce):
         (x,) = inp
         return [x.zeros_like(config.floatX)]
 
+    def clone(self, **kwargs):
+        axis = kwargs.get("axis", self.axis)
+        return type(self)(axis=axis)
 
-class Sum(CAReduceDtype):
+
+class Sum(CAReduce):
     """
     Sums all the values of a tensor along the specified axis(es).
 
-    Equivalent to `CAReduceDtype(scalar.add, axis=axis, dtype=dtype)`,
+    Equivalent to `CAReduce(scalar.add, axis=axis, dtype=dtype)`,
     with the difference that this defines the gradient of sum wrt its
     tensor input.
 
-    Parameters
-    ----------
-    axis
-        Axis(es) along which the tensor should be summed
-        (use None to sum over all axes, and a list or tuple to sum along more
-        than one axis).
-
-    dtype
-        The dtype of the internal accumulator and returned
-        tensor. If None, then we use the default dtype which is the same as the
-        input tensor's dtype except when:
-        - the input dtype is a signed integer of precision < 64 bit, in
-        which case we use int64
-        - the input dtype is an unsigned integer of precision < 64 bit, in
-        which case we use uint64
-        This value does not depend on the value of "acc_dtype".
-
-    acc_dtype
-        The dtype of the internal accumulator.
-        If None (default), we use the dtype in the list below,
-        or the input dtype if its precision is higher:
-        - for int dtypes, we use at least int64;
-        - for uint dtypes, we use at least uint64;
-        - for float dtypes, we use at least float64;
-        - for complex dtypes, we use at least complex128.
-
     """
 
-    __props__ = ("axis", "dtype", "acc_dtype")
     nfunc_spec = ("sum", 1, 1)
 
     def __init__(self, axis=None, dtype=None, acc_dtype=None):
-        super().__init__(aes.add, axis=axis, dtype=dtype, acc_dtype=acc_dtype)
+        super().__init__(
+            aes.add,
+            axis=axis,
+            dtype=dtype,
+            acc_dtype=acc_dtype,
+            upcast_discrete_output=True,
+        )
 
     def __str__(self):
         name = self.__class__.__name__
@@ -2474,6 +2481,12 @@ class Sum(CAReduceDtype):
             return [None]
         return self(*eval_points, return_list=True)
 
+    def clone(self, **kwargs):
+        axis = kwargs.get("axis", self.axis)
+        dtype = kwargs.get("dtype", self.dtype)
+        acc_dtype = kwargs.get("acc_dtype", self.acc_dtype)
+        return type(self)(axis=axis, dtype=dtype, acc_dtype=acc_dtype)
+
 
 def sum(input, axis=None, dtype=None, keepdims=False, acc_dtype=None):
     """
@@ -2505,7 +2518,7 @@ def sum(input, axis=None, dtype=None, keepdims=False, acc_dtype=None):
 pprint.assign(Sum, printing.FunctionPrinter(["sum"], ["axis"]))
 
 
-class Prod(CAReduceDtype):
+class Prod(CAReduce):
     """
     Multiplies all the values of a tensor along the specified axis(es).
 
@@ -2515,18 +2528,19 @@ class Prod(CAReduceDtype):
 
     """
 
-    __props__ = ("axis", "dtype", "acc_dtype")
+    __props__ = ("scalar_op", "axis", "dtype", "acc_dtype", "no_zeros_in_input")
+
     nfunc_spec = ("prod", 1, 1)
 
     def __init__(self, axis=None, dtype=None, acc_dtype=None, no_zeros_in_input=False):
-        super().__init__(aes.mul, axis=axis, dtype=dtype, acc_dtype=acc_dtype)
+        super().__init__(
+            aes.mul,
+            axis=axis,
+            dtype=dtype,
+            acc_dtype=acc_dtype,
+            upcast_discrete_output=True,
+        )
         self.no_zeros_in_input = no_zeros_in_input
-
-    def __setstate__(self, dct):
-        super().__setstate__(dct)
-        # Add default value to be able to reload old pickled objects.
-        if "no_zeros_in_input" not in dct:
-            self.no_zeros_in_input = False
 
     def L_op(self, inp, out, grads):
         """
@@ -2612,7 +2626,6 @@ class Prod(CAReduceDtype):
             # this handles inputs with zeros, but only certain input shapes
             return [grad_case_without_zeros]
         else:
-
             where_zeros = eq(prod_in, 0.0)
             sum_where_zeros = sum(where_zeros, axis=self.axis)
             groups_with_single_zero = eq(sum_where_zeros, 1).dimshuffle(new_dims)
@@ -2649,6 +2662,18 @@ class Prod(CAReduceDtype):
 
     def c_code_cache_version(self):
         return (1,)
+
+    def clone(self, **kwargs):
+        axis = kwargs.get("axis", self.axis)
+        dtype = kwargs.get("dtype", self.dtype)
+        acc_dtype = kwargs.get("acc_dtype", self.acc_dtype)
+        no_zeros_in_input = kwargs.get("no_zeros_in_input", self.no_zeros_in_input)
+        return type(self)(
+            axis=axis,
+            dtype=dtype,
+            acc_dtype=acc_dtype,
+            no_zeros_in_input=no_zeros_in_input,
+        )
 
 
 def prod(
@@ -2718,12 +2743,15 @@ class MulWithoutZeros(BinaryScalarOp):
 mul_without_zeros = MulWithoutZeros(aes.upcast_out, name="mul_without_zeros")
 
 
-class ProdWithoutZeros(CAReduceDtype):
-
-    __props__ = ("axis", "dtype", "acc_dtype")
-
+class ProdWithoutZeros(CAReduce):
     def __init__(self, axis=None, dtype=None, acc_dtype=None):
-        super().__init__(mul_without_zeros, axis=axis, dtype=dtype, acc_dtype=acc_dtype)
+        super().__init__(
+            mul_without_zeros,
+            axis=axis,
+            dtype=dtype,
+            acc_dtype=acc_dtype,
+            upcast_discrete_output=True,
+        )
 
     def grad(self, inp, grads):
         from aesara.gradient import grad_not_implemented
@@ -2738,6 +2766,12 @@ class ProdWithoutZeros(CAReduceDtype):
             "`product(a, no_zeros_in_input=True)`.",
         )
         return [a_grad]
+
+    def clone(self, **kwargs):
+        axis = kwargs.get("axis", self.axis)
+        dtype = kwargs.get("dtype", self.dtype)
+        acc_dtype = kwargs.get("acc_dtype", self.acc_dtype)
+        return type(self)(axis=axis, dtype=dtype, acc_dtype=acc_dtype)
 
 
 def any(x, axis=None, keepdims=False):
@@ -2834,9 +2868,246 @@ def logsumexp(x, axis=None, keepdims=False):
     return log(sum(exp(x), axis=axis, keepdims=keepdims))
 
 
+class MatMul(Op):
+    __props__ = ("dtype",)
+
+    def __init__(self, dtype=None):
+        self.dtype = dtype
+
+    @classmethod
+    def _get_output_shape(cls, x1, x2, shapes, validate=False):
+        x1_shape, x2_shape = shapes
+
+        if x1.ndim == 1 and x2.ndim == 1:
+            if validate and x1_shape[0] != x2_shape[0]:
+                raise ValueError("1d inputs must have the same length.")
+            return ()
+        elif x1.ndim == 1 and x2.ndim > 1:
+            if validate and x1_shape[0] != x2_shape[-2]:
+                raise ValueError(
+                    "length of input 1 must be equal the length "
+                    "of the 2nd-last dimension of input 2"
+                )
+            return x2_shape[:-2] + x2_shape[-1:]
+        elif x1.ndim > 1 and x2.ndim == 1:
+            if validate and x1_shape[-1] != x2_shape[0]:
+                raise ValueError(
+                    "length of input 2 must be equal the length "
+                    "of the last dimension of input 1"
+                )
+            return x1_shape[:-1]
+        elif x1.ndim == 2 and x2.ndim == 2:
+            if validate and x1_shape[-1] != x2_shape[0]:
+                raise ValueError(
+                    "number of columns of input 1 must be equal to "
+                    "the number of rows of input 2"
+                )
+            return x1_shape[:-1] + x2_shape[-1:]
+        elif x1.ndim > 2 and x2.ndim == 2:
+            if validate and x1_shape[-1] != x2_shape[0]:
+                raise ValueError(
+                    "number of rows of input 2 must be equal to "
+                    "the length of the last dimension of input 1"
+                )
+            return x1_shape[:-2] + x1_shape[-2:-1] + x2_shape[-1:]
+        elif x1.ndim == 2 and x2.ndim > 2:
+            if validate and x1_shape[-1] != x2_shape[-2]:
+                raise ValueError(
+                    "number of columns of input 1 must be equal "
+                    "the length of the 2nd-last dimension of input 2"
+                )
+            return x2_shape[:-2] + x1_shape[-2:-1] + x2_shape[-1:]
+        else:
+            if validate:
+                from aesara.tensor.random.basic import broadcast_shapes
+
+                bshape = broadcast_shapes(x1_shape[:-2], x2_shape[:-2])
+                if x1_shape[-1] != x2_shape[-2]:
+                    raise ValueError(
+                        "length of the last dimension of input 1 must be equal "
+                        "to the length of the 2nd-last dimension of input 2"
+                    )
+            else:
+                from aesara.tensor.extra_ops import broadcast_shape
+
+                bshape = broadcast_shape(
+                    x1_shape[:-2], x2_shape[:-2], arrays_are_shapes=True
+                )
+            return bshape + x1_shape[-2:-1] + x2_shape[-1:]
+
+    def make_node(self, a, b):
+        a = as_tensor_variable(a)
+        b = as_tensor_variable(b)
+
+        if 0 in {a.ndim, b.ndim}:
+            raise ValueError("inputs to `matmul` cannot be scalar.")
+
+        out_shape = self._get_output_shape(
+            a, b, (a.type.shape, b.type.shape), validate=True
+        )
+        out = TensorType(dtype=self.dtype, shape=out_shape)()
+        return Apply(self, [a, b], [out])
+
+    def perform(self, node, inputs, outputs):
+        x1, x2 = inputs
+        outputs[0][0] = np.matmul(x1, x2, dtype=self.dtype)
+
+    def infer_shape(self, fgraph, node, shapes):
+        x1, x2 = node.inputs
+        return [self._get_output_shape(x1, x2, shapes)]
+
+
+def matmul(x1: "ArrayLike", x2: "ArrayLike", dtype: Optional["DTypeLike"] = None):
+    """Compute the matrix product of two tensor variables.
+
+    Parameters
+    ----------
+    x1, x2
+        Input arrays, scalars not allowed.
+    dtype
+        The desired data-type for the array. If not given, then the type will
+        be determined as the minimum type required to hold the objects in the
+        sequence.
+
+    Returns
+    -------
+    out : ndarray
+        The matrix product of the inputs. This is a scalar only when both
+        `x1`, `x2` are 1-d vectors.
+
+    Raises
+    ------
+    ValueError
+        If the last dimension of `x1` is not the same size as the second-to-last
+        dimension of `x2`. If a scalar value is passed in.
+
+    Notes
+    -----
+    The behavior depends on the arguments in the following way.
+
+    - If both arguments are 2-D they are multiplied like conventional matrices.
+    - If either argument is N-D, N > 2, it is treated as a stack of matrices
+        residing in the last two indexes and broadcast accordingly.
+    - If the first argument is 1-D, it is promoted to a matrix by prepending a
+        1 to its dimensions. After matrix multiplication the prepended 1 is removed.
+    - If the second argument is 1-D, it is promoted to a matrix by appending a
+        1 to its dimensions. After matrix multiplication the appended 1 is removed.
+
+    `matmul` differs from `dot` in two important ways:
+
+    - Multiplication by scalars is not allowed, use `mul` instead.
+    - Stacks of matrices are broadcast together as if the matrices were elements,
+        respecting the signature ``(n, k), (k, m) -> (n, m)``:
+    """
+    return MatMul(dtype=dtype)(x1, x2)
+
+
+class Convolve(Op):
+    __props__ = ("mode",)
+
+    def __init__(self, mode="full"):
+        self.mode = mode
+
+    @classmethod
+    def _get_output_shape(cls, a, v, shapes, mode, validate=False):
+        a_shape, v_shape = shapes
+        from aesara.tensor.math import maximum, minimum
+
+        if a.ndim == 1 and v.ndim == 1:
+            m, n = a_shape[0], v_shape[0]
+            if n is None or m is None:
+                return (None,)
+            if mode == "full":
+                return (m + n - 1,)
+            elif mode == "same":
+                return (maximum(m, n),)
+            elif mode == "valid":
+                return (maximum(m, n) - minimum(m, n) + 1,)
+            if validate:
+                raise ValueError("Invalid mode - must be full, valid or same")
+            return ()
+        else:
+            if validate:
+                raise ValueError("`a` and `v` must be 1-dim.")
+            return ()
+
+    def make_node(self, a, v):
+        a = as_tensor_variable(a)
+        v = as_tensor_variable(v)
+
+        if a.ndim != 1 or v.ndim != 1:
+            raise ValueError("inputs to `convolve` must be 1-dim.")
+
+        out_shape = self._get_output_shape(
+            a, v, (a.type.shape, v.type.shape), self.mode, validate=True
+        )
+
+        static_out_shape = ()
+        for s in out_shape:
+            try:
+                s_val = get_scalar_constant_value(s)
+            except (NotScalarConstantError, AttributeError):
+                s_val = None
+
+            if s_val:
+                static_out_shape += (s_val,)
+            else:
+                static_out_shape += (None,)
+
+        out = TensorType(
+            aes.upcast(a.type.dtype, v.type.dtype), shape=static_out_shape
+        )()
+        return Apply(self, [a, v], [out])
+
+    def perform(self, node, inputs, outputs):
+        a, v = inputs
+        outputs[0][0] = np.convolve(a, v, mode=self.mode)
+
+    def infer_shape(self, fgraph, node, shapes):
+        a, v = node.inputs
+        return [self._get_output_shape(a, v, shapes, self.mode)]
+
+
+def convolve(
+    a: "ArrayLike", v: "ArrayLike", mode: Literal["full", "same", "valid"] = "full"
+) -> "TensorVariable":
+    """Compute the discrete, linear convolution of two one-dimensional sequences.
+
+    Parameters
+    ----------
+    a, v
+        Input arrays, both should be one dimensional.
+    mode
+       'full':
+            By default, mode is 'full'. This returns the convolution
+            at each point of overlap.
+
+        'same':
+            Mode 'same'. Boundary effects are still visible.
+
+        'valid':
+            The convolution product is only given for points
+            where the signals overlap completely.
+            Values outside the signal boundary have no effect.
+
+    Returns
+    -------
+    out
+        Discrete, linear convolution of a and v.
+
+    Raises
+    ------
+    ValueError
+        If the a and v are not one-dimensional.
+
+    """
+    return Convolve(mode=mode)(a, v)
+
+
 __all__ = [
     "max_and_argmax",
     "max",
+    "matmul",
     "argmax",
     "min",
     "argmin",
@@ -2861,13 +3132,11 @@ __all__ = [
     "invert",
     "bitwise_not",
     "abs",
-    "abs_",
     "exp",
     "exp2",
     "expm1",
     "neg",
     "reciprocal",
-    "inv",
     "log",
     "log2",
     "log10",
@@ -2880,7 +3149,6 @@ __all__ = [
     "round",
     "round_half_to_even",
     "round_half_away_from_zero",
-    "sqr",
     "square",
     "cov",
     "sqrt",
@@ -2904,6 +3172,7 @@ __all__ = [
     "erfcx",
     "erfinv",
     "erfcinv",
+    "owens_t",
     "gamma",
     "gammaln",
     "psi",
@@ -2931,6 +3200,7 @@ __all__ = [
     "angle",
     "complex",
     "conj",
+    "conjugate",
     "complex_from_polar",
     "sum",
     "prod",
@@ -2944,9 +3214,8 @@ __all__ = [
     "add",
     "sub",
     "mul",
-    "true_div",
-    "int_div",
-    "floor_div",
+    "true_divide",
+    "floor_divide",
     "ceil_intdiv",
     "mod",
     "pow",
@@ -2961,4 +3230,48 @@ __all__ = [
     "power",
     "logaddexp",
     "logsumexp",
+    "hyp2f1",
+    "hyp2f1_der",
+    "convolve",
 ]
+
+DEPRECATED_NAMES: List[Tuple[str, str, object]] = [
+    ("abs_", "`abs_` is deprecated; use `abs` instead.", abs),
+    ("inv", "`inv` is deprecated; use `reciprocal` instead.", reciprocal),
+    (
+        "true_div",
+        "`true_div` is deprecated; use `true_divide` or `divide` instead.",
+        true_divide,
+    ),
+    ("int_div", "`int_div` is deprecated; use `floor_divide` instead.", floor_divide),
+    (
+        "floor_div",
+        "`floor_div` is deprecated; use `floor_divide` instead.",
+        floor_divide,
+    ),
+    (
+        "sqr",
+        "`sqr` is deprecated; use `square` instead.",
+        square,
+    ),
+]
+
+
+def __getattr__(name):
+    """Intercept module-level attribute access of deprecated symbols.
+
+    Adapted from https://stackoverflow.com/a/55139609/3006474.
+
+    """
+    from warnings import warn
+
+    for old_name, msg, old_object in DEPRECATED_NAMES:
+        if name == old_name:
+            warn(msg, DeprecationWarning, stacklevel=2)
+            return old_object
+
+    raise AttributeError(f"module {__name__} has no attribute {name}")
+
+
+def __dir__():
+    return sorted(__all__ + [names[0] for names in DEPRECATED_NAMES])

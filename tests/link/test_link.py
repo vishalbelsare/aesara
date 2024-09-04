@@ -75,7 +75,6 @@ def double(name):
 
 
 class MyOp(Op):
-
     __props__ = ("nin", "name", "impl")
 
     def __init__(self, nin, name, impl=None):
@@ -220,7 +219,6 @@ class TestWrapLinker:
 
 
 def test_sort_schedule_fn():
-    import aesara
     from aesara.graph.sched import make_depends, sort_schedule_fn
 
     x = matrix("x")

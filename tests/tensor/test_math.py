@@ -1,7 +1,6 @@
 import builtins
 import operator
 import pickle
-import warnings
 from copy import copy
 from functools import reduce
 from itertools import product
@@ -34,12 +33,15 @@ from aesara.tensor.basic import (
 from aesara.tensor.elemwise import CAReduce, Elemwise
 from aesara.tensor.math import (
     Argmax,
+    Convolve,
     Dot,
+    MatMul,
     MaxAndArgmax,
     Mean,
     Prod,
     ProdWithoutZeros,
     Sum,
+    _allclose,
     _dot,
     abs,
     add,
@@ -58,6 +60,7 @@ from aesara.tensor.math import (
     clip,
     complex_from_polar,
     conj,
+    convolve,
     cos,
     cosh,
     cov,
@@ -80,6 +83,7 @@ from aesara.tensor.math import (
     log10,
     logaddexp,
     logsumexp,
+    matmul,
     max,
     max_and_argmax,
     maximum,
@@ -102,12 +106,12 @@ from aesara.tensor.math import (
     sin,
     sinh,
     smallest,
-    sqr,
     sqrt,
+    square,
     sub,
 )
 from aesara.tensor.math import sum as at_sum
-from aesara.tensor.math import tan, tanh, tensordot, true_div, trunc, var
+from aesara.tensor.math import tan, tanh, tensordot, true_divide, trunc, var
 from aesara.tensor.type import (
     TensorType,
     complex_dtypes,
@@ -141,6 +145,7 @@ from aesara.tensor.type_other import NoneConst
 from tests import unittest_tools as utt
 from tests.link.test_link import make_function
 from tests.tensor.utils import (
+    ALL_DTYPES,
     _bad_build_broadcast_binary_normal,
     _bad_runtime_broadcast_binary_normal,
     _bad_runtime_reciprocal,
@@ -174,7 +179,6 @@ from tests.tensor.utils import (
     copymod,
     div_grad_rtol,
     eval_outputs,
-    get_numeric_types,
     ignore_isfinite_mode,
     inplace_func,
     integers,
@@ -325,7 +329,7 @@ _grad_broadcast_div_mod_normal = dict(
 # fmt: on
 
 TestTrueDivBroadcast = makeBroadcastTester(
-    op=true_div,
+    op=true_divide,
     expected=_numpy_true_div,
     good=_good_broadcast_div_mod_normal_float_no_complex,
     grad=_grad_broadcast_div_mod_normal,
@@ -431,7 +435,7 @@ TestRoundHalfAwayFromZeroBroadcast = makeBroadcastTester(
 )
 
 TestSqrBroadcast = makeBroadcastTester(
-    op=sqr,
+    op=square,
     expected=np.square,
     good=_good_broadcast_unary_normal,
     grad=_grad_broadcast_unary_normal,
@@ -560,7 +564,7 @@ TestCosBroadcast = makeBroadcastTester(
 
 
 def test_py_c_match():
-    a = TensorType(dtype="int8", shape=(False,))()
+    a = TensorType(dtype="int8", shape=(None,))()
     f = function([a], arccos(a), mode="DebugMode")
     # This can fail in DebugMode
     f(np.asarray([1, 0, -1], dtype="int8"))
@@ -696,7 +700,7 @@ TestComplexFromPolarBroadcast = makeBroadcastTester(
 )
 
 TestConjBroadcast = makeBroadcastTester(
-    op=conj, expected=np.conj, good=_good_broadcast_unary_normal
+    op=conj, expected=np.conj, good={"complex": _good_broadcast_unary_normal["complex"]}
 )
 
 
@@ -772,7 +776,7 @@ class TestMaxAndArgmax:
     def test_basic_2(self):
         data = random(2, 3)
         n = as_tensor_variable(data)
-        for (axis, np_axis) in [
+        for axis, np_axis in [
             (-1, -1),
             (0, 0),
             (1, 1),
@@ -793,7 +797,7 @@ class TestMaxAndArgmax:
         # Test negative values and bigger range to make sure numpy don't do the argmax as on uint16
         data = (random(20, 30).astype("float16") - 0.5) * 20
         n = shared(data)
-        for (axis, np_axis) in [
+        for axis, np_axis in [
             (-1, -1),
             (0, 0),
             (1, 1),
@@ -841,7 +845,7 @@ class TestMaxAndArgmax:
     def test_basic_3(self):
         data = random(2, 3, 4)
         n = as_tensor_variable(data)
-        for (axis, np_axis) in [
+        for axis, np_axis in [
             (-1, -1),
             (0, 0),
             (1, 1),
@@ -1003,7 +1007,7 @@ class TestArgminArgmax:
         data = random(2, 3)
         n = as_tensor_variable(data)
         for fct, nfct in [(argmax, np.argmax), (argmin, np.argmin)]:
-            for (axis, np_axis) in [
+            for axis, np_axis in [
                 (-1, -1),
                 (0, 0),
                 (1, 1),
@@ -1022,7 +1026,7 @@ class TestArgminArgmax:
         n = shared(data)
         mode = get_default_mode().including("local_max_and_argmax", "uncanonicalize")
         for fct, nfct in [(argmax, np.argmax), (argmin, np.argmin)]:
-            for (axis, np_axis) in [
+            for axis, np_axis in [
                 (-1, -1),
                 (0, 0),
                 (1, 1),
@@ -1062,7 +1066,7 @@ class TestArgminArgmax:
         data = random(2, 3, 4)
         n = as_tensor_variable(data)
         for fct, nfct in [(argmax, np.argmax), (argmin, np.argmin)]:
-            for (axis, np_axis) in [
+            for axis, np_axis in [
                 (-1, -1),
                 (0, 0),
                 (1, 1),
@@ -1162,7 +1166,7 @@ class TestMinMax:
         data = random(2, 3)
         n = as_tensor_variable(data)
         for fct, nfct in [(max, np.max), (min, np.min)]:
-            for (axis, np_axis) in [
+            for axis, np_axis in [
                 (-1, -1),
                 (0, 0),
                 (1, 1),
@@ -1203,7 +1207,7 @@ class TestMinMax:
         data = random(2, 3, 4)
         n = as_tensor_variable(data)
         for fct, nfct in [(max, np.max), (min, np.min)]:
-            for (axis, np_axis) in [
+            for axis, np_axis in [
                 (-1, -1),
                 (0, 0),
                 (1, 1),
@@ -1458,8 +1462,8 @@ class TestOuter:
     def test_outer(self):
         for m in range(4):
             for n in range(4):
-                x = tensor(dtype="floatX", shape=(False,) * m)
-                y = tensor(dtype="floatX", shape=(False,) * n)
+                x = tensor(dtype="floatX", shape=(None,) * m)
+                y = tensor(dtype="floatX", shape=(None,) * n)
                 s1 = self.rng.integers(1, 10, m)
                 s2 = self.rng.integers(1, 10, n)
                 v1 = np.asarray(self.rng.random(s1)).astype(config.floatX)
@@ -1830,8 +1834,8 @@ class TestDivimpl:
         assert np.allclose(function([i, f], f / i)(5, 11.0), (11.0 / 5.0))
         assert np.allclose(function([i, ii], i // ii)(5, 3), (5 // 3))
         assert np.allclose(function([i, ii], ii // i)(5, 3), (3 // 5))
-        assert np.allclose(function([i, ii], true_div(i, ii))(5, 3), (5.0 / 3.0))
-        assert np.allclose(function([i, ii], true_div(ii, i))(5, 3), (3.0 / 5.0))
+        assert np.allclose(function([i, ii], true_divide(i, ii))(5, 3), (5.0 / 3.0))
+        assert np.allclose(function([i, ii], true_divide(ii, i))(5, 3), (3.0 / 5.0))
         assert np.allclose(function([i, c], i / c)(5, complex(5, 3)), (5.0 / (5 + 3j)))
         assert np.allclose(function([i, c], c / i)(5, complex(5, 3)), ((5 + 3j) / 5.0))
 
@@ -1913,66 +1917,41 @@ class TestDot:
         # TODO: What about the broadcastable conditions in `Dot.grad`?
 
     def test_broadcastable_patterns(self):
-
         #
         # These examples should all work.  All dimensions of all results have
         # size 1.
         #
-        def val_for(r):
-            if r.dtype.startswith("complex"):
-                # We want to test complex at the same time, so we give a value
-                # to the imaginary component.
-                # This strange way of doing things is the only way that worked
-                # on NumPy 1.4.1.
-                if r.ndim == 0:
-                    return np.asarray(complex(1.1, 2.1), dtype=r.dtype)
-                if r.ndim == 1:
-                    if r.dtype == "complex64":
-                        return np.complex64([complex(1.2, 2.2)])
-                    elif r.dtype == "complex128":
-                        return np.complex128([complex(1.2, 2.2)])
-                elif r.ndim == 2:
-                    if r.dtype == "complex64":
-                        return np.complex64([[complex(1.3, 2.3)]])
-                    elif r.dtype == "complex128":
-                        return np.complex128([[complex(1.3, 2.3)]])
-
-            if r.ndim == 0:
-                return np.asarray(1.1, dtype=r.dtype)
-            if r.ndim == 1:
-                return np.asarray([1.2], dtype=r.dtype)
-            elif r.ndim == 2:
-                return np.asarray([[1.3]], dtype=r.dtype)
-            raise AssertionError()
+        def is_super_shape(var1, var2):
+            # Check that var1.type is a superset of var2.type, ignoring dtype
+            return var1.type.is_super(var2.type.clone(dtype=var1.type.dtype))
 
         for dtype0 in ("float32", "float64", "complex64"):
             for dtype1 in ("float32", "complex64", "complex128"):
                 for bc0 in (
-                    (True,),
-                    (False,),
-                    (True, True),
-                    (True, False),
-                    (False, True),
-                    (False, False),
+                    (1,),
+                    (None,),
+                    (1, 1),
+                    (1, None),
+                    (None, 1),
+                    (None, None),
                 ):
                     x = TensorType(dtype=dtype0, shape=bc0)()
                     for bc1 in (
-                        (True,),
-                        (False,),
-                        (True, True),
-                        (True, False),
-                        (False, True),
-                        (False, False),
+                        (1,),
+                        (None,),
+                        (1, 1),
+                        (1, None),
+                        (None, 1),
+                        (None, None),
                     ):
-
                         y = TensorType(dtype=dtype1, shape=bc1)()
                         z = dense_dot(x, y)
 
                         if dtype0.startswith("float") and dtype1.startswith("float"):
                             g = grad(z.sum(), x)
-                            assert g.broadcastable == x.broadcastable
+                            assert is_super_shape(x, g)
                             g = grad(z.sum(), y)
-                            assert g.broadcastable == y.broadcastable
+                            assert is_super_shape(y, g)
 
 
 class TestTensordot:
@@ -2138,7 +2117,7 @@ class TestTensordot:
 
     def test_broadcastable1(self):
         rng = np.random.default_rng(seed=utt.fetch_seed())
-        x = TensorType(dtype=config.floatX, shape=(True, False, False))("x")
+        x = TensorType(dtype=config.floatX, shape=(1, None, None))("x")
         y = tensor3("y")
         z = tensordot(x, y)
         assert z.broadcastable == (True, False)
@@ -2150,7 +2129,7 @@ class TestTensordot:
 
     def test_broadcastable2(self):
         rng = np.random.default_rng(seed=utt.fetch_seed())
-        x = TensorType(dtype=config.floatX, shape=(True, False, False))("x")
+        x = TensorType(dtype=config.floatX, shape=(1, None, None))("x")
         y = tensor3("y")
         axes = [[2, 1], [0, 1]]
         z = tensordot(x, y, axes=axes)
@@ -2177,7 +2156,7 @@ def test_smallest():
 
 
 def test_var():
-    a = TensorType(dtype="float64", shape=[False, False, False])()
+    a = TensorType(dtype="float64", shape=(None, None, None))()
     f = function([a], var(a))
 
     a_val = np.arange(6).reshape(1, 2, 3)
@@ -2227,7 +2206,7 @@ def test_var():
 class TestSum:
     def test_sum_overflow(self):
         # Ensure that overflow errors are a little bit harder to get
-        a = TensorType(dtype="int8", shape=[False])()
+        a = TensorType(dtype="int8", shape=(None,))()
         f = function([a], at_sum(a))
         assert f([1] * 300) == 300
 
@@ -2245,139 +2224,137 @@ class TestArithmeticCast:
 
     """
 
-    def test_arithmetic_cast(self):
-        dtypes = get_numeric_types(with_complex=True)
+    @pytest.mark.parametrize(
+        "op",
+        [
+            operator.add,
+            operator.sub,
+            operator.mul,
+            operator.truediv,
+            operator.floordiv,
+        ],
+    )
+    @pytest.mark.parametrize("a_type", ALL_DTYPES)
+    @pytest.mark.parametrize("b_type", ALL_DTYPES)
+    @pytest.mark.parametrize(
+        "combo",
+        [
+            ("scalar", "scalar"),
+            ("array", "array"),
+            ("scalar", "array"),
+            ("array", "scalar"),
+            ("i_scalar", "i_scalar"),
+        ],
+    )
+    def test_arithmetic_cast(self, op, a_type, b_type, combo):
+        if op is operator.floordiv and (
+            a_type.startswith("complex") or b_type.startswith("complex")
+        ):
+            pytest.skip("Not supported by NumPy")
 
         # Here:
         # scalar == scalar stored as a 0d array
         # array == 1d array
         # i_scalar == scalar type used internally by Aesara
-        def Aesara_scalar(dtype):
+        def aesara_scalar(dtype):
             return scalar(dtype=str(dtype))
 
         def numpy_scalar(dtype):
             return np.array(1, dtype=dtype)
 
-        def Aesara_array(dtype):
+        def aesara_array(dtype):
             return vector(dtype=str(dtype))
 
         def numpy_array(dtype):
             return np.array([1], dtype=dtype)
 
-        def Aesara_i_scalar(dtype):
+        def aesara_i_scalar(dtype):
             return aes.ScalarType(str(dtype))()
 
         def numpy_i_scalar(dtype):
             return numpy_scalar(dtype)
 
-        with warnings.catch_warnings():
-            # Avoid deprecation warning during tests.
-            warnings.simplefilter("ignore", category=DeprecationWarning)
-            for cfg in ("numpy+floatX",):  # Used to test 'numpy' as well.
-                with config.change_flags(cast_policy=cfg):
-                    for op in (
-                        operator.add,
-                        operator.sub,
-                        operator.mul,
-                        operator.truediv,
-                        operator.floordiv,
-                    ):
-                        for a_type in dtypes:
-                            for b_type in dtypes:
+        with config.change_flags(cast_policy="numpy+floatX"):
+            # We will test all meaningful combinations of
+            # scalar and array operations.
+            aesara_args = list(map(eval, [f"aesara_{c}" for c in combo]))
+            numpy_args = list(map(eval, [f"numpy_{c}" for c in combo]))
+            aesara_arg_1 = aesara_args[0](a_type)
+            aesara_arg_2 = aesara_args[1](b_type)
+            aesara_dtype = op(
+                aesara_arg_1,
+                aesara_arg_2,
+            ).type.dtype
 
-                                # We will test all meaningful combinations of
-                                # scalar and array operations.
-                                for combo in (
-                                    ("scalar", "scalar"),
-                                    ("array", "array"),
-                                    ("scalar", "array"),
-                                    ("array", "scalar"),
-                                    ("i_scalar", "i_scalar"),
-                                ):
+            # For numpy we have a problem:
+            #   http://projects.scipy.org/numpy/ticket/1827
+            # As a result we only consider the highest data
+            # type that numpy may return.
+            numpy_arg_1 = numpy_args[0](a_type)
+            numpy_arg_2 = numpy_args[1](b_type)
+            numpy_dtypes = [
+                op(numpy_arg_1, numpy_arg_2).dtype,
+                op(numpy_arg_2, numpy_arg_1).dtype,
+            ]
+            numpy_dtype = aes.upcast(*list(map(str, numpy_dtypes)))
 
-                                    Aesara_args = list(
-                                        map(eval, [f"Aesara_{c}" for c in combo])
-                                    )
-                                    numpy_args = list(
-                                        map(eval, [f"numpy_{c}" for c in combo])
-                                    )
-                                    Aesara_dtype = op(
-                                        Aesara_args[0](a_type),
-                                        Aesara_args[1](b_type),
-                                    ).type.dtype
+            if numpy_dtype == aesara_dtype:
+                # Same data type found, all is good!
+                return
 
-                                    # For numpy we have a problem:
-                                    #   http://projects.scipy.org/numpy/ticket/1827
-                                    # As a result we only consider the highest data
-                                    # type that numpy may return.
-                                    numpy_dtypes = [
-                                        op(
-                                            numpy_args[0](a_type), numpy_args[1](b_type)
-                                        ).dtype,
-                                        op(
-                                            numpy_args[1](b_type), numpy_args[0](a_type)
-                                        ).dtype,
-                                    ]
-                                    numpy_dtype = aes.upcast(
-                                        *list(map(str, numpy_dtypes))
-                                    )
-                                    if numpy_dtype == Aesara_dtype:
-                                        # Same data type found, all is good!
-                                        continue
-                                    if (
-                                        cfg == "numpy+floatX"
-                                        and config.floatX == "float32"
-                                        and a_type != "float64"
-                                        and b_type != "float64"
-                                        and numpy_dtype == "float64"
-                                    ):
-                                        # We should keep float32.
-                                        assert Aesara_dtype == "float32"
-                                        continue
-                                    if "array" in combo and "scalar" in combo:
-                                        # For mixed scalar / array operations,
-                                        # Aesara may differ from numpy as it does
-                                        # not try to prevent the scalar from
-                                        # upcasting the array.
-                                        array_type, scalar_type = (
-                                            (a_type, b_type)[list(combo).index(arg)]
-                                            for arg in ("array", "scalar")
-                                        )
-                                        up_type = aes.upcast(array_type, scalar_type)
-                                        if (
-                                            # The two data types are different.
-                                            scalar_type != array_type
-                                            and
-                                            # The array type is not enough to hold
-                                            # the scalar type as well.
-                                            array_type != up_type
-                                            and
-                                            # Aesara upcasted the result array.
-                                            Aesara_dtype == up_type
-                                            and
-                                            # But Numpy kept its original type.
-                                            array_type == numpy_dtype
-                                        ):
-                                            # Then we accept this difference in
-                                            # behavior.
-                                            continue
+            if (
+                config.floatX == "float32"
+                and a_type != "float64"
+                and b_type != "float64"
+                and numpy_dtype == "float64"
+            ):
+                # We should keep float32.
+                assert aesara_dtype == "float32"
+                return
 
-                                    if (
-                                        cfg == "numpy+floatX"
-                                        and a_type == "complex128"
-                                        and (b_type == "float32" or b_type == "float16")
-                                        and combo == ("scalar", "array")
-                                        and Aesara_dtype == "complex128"
-                                        and numpy_dtype == "complex64"
-                                    ):
-                                        # In numpy 1.6.x adding a complex128 with
-                                        # a float32 may result in a complex64. As
-                                        # of 1.9.2. this is still the case so it is
-                                        # probably by design
-                                        pytest.skip("Known issue with" "numpy see #761")
-                                    # In any other situation: something wrong is
-                                    # going on!
-                                    raise AssertionError()
+            if "array" in combo and "scalar" in combo:
+                # For mixed scalar / array operations,
+                # Aesara may differ from numpy as it does
+                # not try to prevent the scalar from
+                # upcasting the array.
+                array_type, scalar_type = (
+                    (a_type, b_type)[list(combo).index(arg)]
+                    for arg in ("array", "scalar")
+                )
+                up_type = aes.upcast(array_type, scalar_type)
+                if (
+                    # The two data types are different.
+                    scalar_type != array_type
+                    and
+                    # The array type is not enough to hold
+                    # the scalar type as well.
+                    array_type != up_type
+                    and
+                    # Aesara upcasted the result array.
+                    aesara_dtype == up_type
+                    and
+                    # But Numpy kept its original type.
+                    array_type == numpy_dtype
+                ):
+                    # Then we accept this difference in
+                    # behavior.
+                    return
+
+            if (
+                {a_type, b_type} == {"complex128", "float32"}
+                or {a_type, b_type} == {"complex128", "float16"}
+                and set(combo) == {"scalar", "array"}
+                and aesara_dtype == "complex128"
+                and numpy_dtype == "complex64"
+            ):
+                # In numpy 1.6.x adding a complex128 with
+                # a float32 may result in a complex64. As
+                # of 1.9.2. this is still the case so it is
+                # probably by design
+                pytest.skip("Known issue with" "numpy see #761")
+            # In any other situation: something wrong is
+            # going on!
+            raise AssertionError()
 
 
 def test_divmod():
@@ -2436,7 +2413,6 @@ class TestInferShape(utt.InferShapeTester):
         )
 
     def test_MaxAndArgmax(self):
-
         adtens3 = dtensor3()
         adtens3_val = random(4, 5, 3)
         self._compile_and_check(
@@ -2567,6 +2543,10 @@ class TestTensorInstanceMethods:
         assert_array_equal(Z.conj().eval({Z: z}), z.conj())
         assert_array_equal(Z.conjugate().eval({Z: z}), z.conj())
 
+        # No conjugate when the data type isn't complex
+        assert X.type.dtype not in complex_dtypes
+        assert X.conj() is X
+
     def test_round(self):
         X, _ = self.vars
         x, _ = self.vals
@@ -2683,7 +2663,7 @@ class TestProd:
         # second time, with some added complexity
         # verify_grad takes the sum of the matrices anyway
         def fn(x2):
-            return sqr(Prod(axis=1)(x2))
+            return square(Prod(axis=1)(x2))
 
         utt.verify_grad(fn, [x_val], mode=self.mode)
 
@@ -3061,7 +3041,7 @@ class TestMeanDtype:
                     try:
                         grad(mean_var.sum(), x, disconnected_inputs="ignore")
                     except NotImplementedError:
-                        # TrueDiv does not seem to have a gradient when
+                        # TrueDivide does not seem to have a gradient when
                         # the numerator is complex.
                         if mean_var.dtype in complex_dtypes:
                             pass
@@ -3245,7 +3225,6 @@ def reduce_bitwise_and(x, axis=-1, dtype="int8"):
 
 
 def test_clip_grad():
-
     # test the gradient of clip
     def func(x, y, z):
         return clip(x, y, z)
@@ -3281,7 +3260,7 @@ def test_grad_useless_sum():
 
     mode = get_default_mode().including("canonicalize")
     mode.check_isfinite = False
-    x = TensorType(config.floatX, (True,))("x")
+    x = TensorType(config.floatX, shape=(1,))("x")
     l = log(1.0 - sigmoid(x))[0]
     g = grad(l, x)
 
@@ -3306,8 +3285,8 @@ def test_tanh_grad_broadcast():
     # FIXME: This is not a real test.
     # This crashed in the past.
 
-    x = tensor(dtype="float32", shape=(True, False, False, False))
-    y = tensor(dtype="float32", shape=(True, True, False, False))
+    x = tensor(dtype="float32", shape=(1, None, None, None))
+    y = tensor(dtype="float32", shape=(1, 1, None, None))
 
     # TODO FIXME: This is a bad test
     grad(tanh(x).sum(), x)
@@ -3401,3 +3380,291 @@ def test_log1mexp_grad_lim():
     assert grad_x_fn(-0.0) == -np.inf
     assert grad_x_fn(-1e-309) == -np.inf
     assert grad_x_fn(-1e-308) != -np.inf
+
+
+class TestMatMul(utt.InferShapeTester):
+    def setup_method(self):
+        super().setup_method()
+        self.rng = np.random.default_rng(utt.fetch_seed())
+        self.op = matmul
+        self.op_class = MatMul
+
+    def _validate_output(self, a, b):
+        aesara_sol = self.op(a, b).eval()
+        numpy_sol = np.matmul(a, b)
+        assert _allclose(numpy_sol, aesara_sol)
+
+    @pytest.mark.parametrize(
+        "x1, x2",
+        [
+            # test output when both inputs are vectors
+            (np.arange(3).astype(config.floatX), np.arange(3).astype(config.floatX)),
+            # test output when both inputs are matrices
+            (
+                np.arange(3 * 5).reshape((5, 3)).astype(config.floatX),
+                np.arange(2 * 3).reshape((3, 2)).astype(config.floatX),
+            ),
+            # test behaviour when one of the inputs is has dimension > 2
+            (
+                np.arange(3 * 5).reshape((5, 3)).astype(config.floatX),
+                np.arange(2 * 3 * 5).reshape((2, 3, 5)).astype(config.floatX),
+            ),
+            # test behaviour when one of the inputs is a vector
+            (
+                np.arange(3 * 5).reshape((5, 3)).astype(config.floatX),
+                np.arange(3).astype(config.floatX),
+            ),
+            (
+                np.arange(5).astype(config.floatX),
+                np.arange(3 * 5).reshape((5, 3)).astype(config.floatX),
+            ),
+            # check if behaviour is correct N-D arrays where N > 2.
+            (
+                np.arange(2 * 2 * 4).reshape((2, 2, 4)).astype(config.floatX),
+                np.arange(2 * 2 * 4).reshape((2, 4, 2)).astype(config.floatX),
+            ),
+        ],
+    )
+    def test_op(self, x1, x2):
+        self._validate_output(x1, x2)
+
+    def test_scalar_error(self):
+        with pytest.raises(ValueError, match="cannot be scalar"):
+            self.op(4, [4, 1])
+
+    @pytest.mark.parametrize("dtype", (np.float16, np.float32, np.float64))
+    def test_dtype_param(self, dtype):
+        sol = self.op([1, 2, 3], [3, 2, 1], dtype=dtype)
+        assert sol.eval().dtype == dtype
+
+    @pytest.mark.parametrize(
+        "x1_shape,x2_shape,exp_res,error_regex",
+        [
+            ((1,), (3,), None, "inputs must have the same length"),
+            ((2,), (3, 1), None, "length of input 1.*2nd-last dimension of input 2"),
+            ((2, 5), (3,), None, "length of input 2.*of the last dimension of input 1"),
+            (
+                (2, 5),
+                (3, 4),
+                None,
+                "number of columns of input 1 .* number of rows of input 2",
+            ),
+            (
+                (2, 1, 3),
+                (5, 4),
+                None,
+                "number of rows of input 2 .* last dimension of input 1",
+            ),
+            (
+                (2, 5),
+                (2, 4, 3),
+                None,
+                "number of columns of input 1 .* 2nd-last dimension of input 2",
+            ),
+            (
+                (3, 2, 4, 5),
+                (1, 6, 7),
+                None,
+                "length of the last dimension of input 1 .* 2nd-last dimension of input 2",
+            ),
+            (
+                (4, 5, 4),
+                (3, 2, 2),
+                None,
+                "cannot be broadcast to a single shape",
+            ),
+            (
+                (4, None, 2),
+                (4, 2, None),
+                (4, None, None),
+                None,
+            ),
+        ],
+    )
+    def test_get_output_shape(self, x1_shape, x2_shape, exp_res, error_regex):
+        x1 = tensor(dtype=np.float64, shape=x1_shape)
+        x2 = tensor(dtype=np.float64, shape=x2_shape)
+
+        if error_regex is not None:
+            with pytest.raises(ValueError, match=error_regex):
+                self.op_class._get_output_shape(
+                    x1, x2, (x1_shape, x2_shape), validate=True
+                )
+        else:
+            assert (
+                self.op_class._get_output_shape(
+                    x1, x2, (x1_shape, x2_shape), validate=True
+                )
+                == exp_res
+            )
+
+    def test_infer_shape(self):
+        for shape_x1, shape_x2 in [
+            ((5,), (5,)),
+            ((5,), (2, 5, 3)),
+            ((2, 5, 3), (3,)),
+            ((2, 5), (5, 4)),
+            ((2, 5), (2, 5, 3)),
+            ((2, 1, 3), (3, 4)),
+            ((3, 2, 4, 5), (1, 5, 7)),
+        ]:
+            a = tensor(dtype=config.floatX, shape=shape_x1)
+            b = tensor(dtype=config.floatX, shape=shape_x2)
+            x1 = self.rng.random(shape_x1).astype(config.floatX)
+            x2 = self.rng.random(shape_x2).astype(config.floatX)
+
+            self._compile_and_check(
+                [a, b],
+                [self.op(a, b)],
+                [x1, x2],
+                self.op_class,
+            )
+
+
+def test_log_diff_exp():
+    mode = get_default_mode().including("log_diff_exp").excluding("fusion", "inplace")
+
+    x = fmatrix()
+    y = fmatrix()
+    f = function([x, y], log(exp(x) - exp(y)), mode=mode)
+
+    fgraph_ops = tuple(node.op for node in f.maker.fgraph.apply_nodes)
+
+    assert log not in fgraph_ops
+    assert log1mexp in fgraph_ops
+
+    f = function([x, y], log(exp(x) - y), mode=mode)
+
+    fgraph_ops = tuple(node.op for node in f.maker.fgraph.apply_nodes)
+
+    assert log1mexp not in fgraph_ops
+
+
+def test_deprecations():
+    """Make sure we can import from deprecated modules."""
+
+    with pytest.deprecated_call():
+        from aesara.tensor.math import abs_  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor import abs_  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor import inv  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor.math import inv  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor import true_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor.math import true_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor import floor_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor.math import floor_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor import int_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor.math import int_div  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor import sqr  # noqa: F401 F811
+
+    with pytest.deprecated_call():
+        from aesara.tensor.math import sqr  # noqa: F401 F811
+
+
+class TestConvolve(utt.InferShapeTester):
+    @pytest.mark.parametrize(
+        "a, v, mode",
+        [
+            (
+                np.arange(3).astype(config.floatX),
+                np.arange(6).astype(config.floatX),
+                "full",
+            ),
+            (
+                np.arange(5).astype(config.floatX),
+                np.arange(3).astype(config.floatX),
+                "valid",
+            ),
+            (
+                np.arange(8).astype(config.floatX),
+                np.arange(9).astype(config.floatX),
+                "same",
+            ),
+            (np.arange(3).astype(int), np.arange(6).astype(int), "full"),
+            (
+                np.random.normal(size=4).astype(config.floatX),
+                np.random.uniform(size=8).astype(int),
+                "valid",
+            ),
+        ],
+    )
+    def test_op(self, a, v, mode):
+        aesara_sol = convolve(a, v, mode=mode).eval()
+        numpy_sol = np.convolve(a, v, mode=mode)
+        assert np.allclose(numpy_sol, aesara_sol)
+
+    def test_scalar_error(self):
+        with pytest.raises(ValueError, match="must be 1-dim"):
+            convolve(4, [4, 1])
+
+    @pytest.mark.parametrize(
+        "a_shape, v_shape, mode, error_regex",
+        [
+            ((2,), (3, 1), "full", "must be 1-dim"),
+            ((2,), (3,), "val", "must be full, valid or same"),
+        ],
+    )
+    def test_get_output_shape_error(self, a_shape, v_shape, mode, error_regex):
+        a = tensor(dtype=np.float64, shape=a_shape)
+        v = tensor(dtype=np.float64, shape=v_shape)
+
+        with pytest.raises(ValueError, match=error_regex):
+            Convolve._get_output_shape(a, v, (a_shape, v_shape), mode, validate=True)
+        assert (
+            Convolve._get_output_shape(a, v, (a_shape, v_shape), mode, validate=False)
+            == ()
+        )
+
+    @pytest.mark.parametrize(
+        "a_shape, v_shape, a1_shape, v1_shape",
+        [
+            ((5,), (5,), (5,), (5,)),
+            ((1,), (5,), (1,), (5,)),
+            ((1,), (1,), (1,), (1,)),
+            ((3,), (1,), (3,), (1,)),
+            ((None,), (3,), (4,), (3,)),
+            ((None,), (None,), (4,), (2,)),
+            ((2,), (None,), (2,), (3,)),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "full",
+            "valid",
+            "same",
+        ],
+    )
+    def test_infer_shape(self, a_shape, v_shape, a1_shape, v1_shape, mode):
+        a = tensor(dtype=config.floatX, shape=a_shape)
+        v = tensor(dtype=config.floatX, shape=v_shape)
+
+        rng = np.random.default_rng(utt.fetch_seed())
+        a1 = rng.random(a1_shape).astype(config.floatX)
+        v1 = rng.random(v1_shape).astype(config.floatX)
+
+        self._compile_and_check(
+            [a, v],
+            [convolve(a, v, mode)],
+            [a1, v1],
+            Convolve,
+        )

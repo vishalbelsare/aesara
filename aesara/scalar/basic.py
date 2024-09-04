@@ -16,7 +16,7 @@ from collections.abc import Callable
 from copy import copy
 from itertools import chain
 from textwrap import dedent
-from typing import Any, Dict, Mapping, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Type, Union
 
 import numpy as np
 from typing_extensions import TypeAlias
@@ -27,8 +27,9 @@ from aesara.configdefaults import config
 from aesara.gradient import DisconnectedType, grad_undefined
 from aesara.graph.basic import Apply, Constant, Variable, clone, list_of_nodes
 from aesara.graph.fg import FunctionGraph
-from aesara.graph.opt import MergeOptimizer
-from aesara.graph.type import HasDataType
+from aesara.graph.op import HasInnerGraph
+from aesara.graph.rewriting.basic import MergeOptimizer
+from aesara.graph.type import HasDataType, HasShape
 from aesara.graph.utils import MetaObject, MethodNotDefined
 from aesara.link.c.op import COp
 from aesara.link.c.type import CType
@@ -268,7 +269,7 @@ def convert(x, dtype=None):
     return x_
 
 
-class ScalarType(CType, HasDataType):
+class ScalarType(CType, HasDataType, HasShape):
 
     """
     Internal class, should not be used by clients.
@@ -415,7 +416,7 @@ class ScalarType(CType, HasDataType):
         return upcast(*[x.dtype for x in [self] + list(others)])
 
     def make_variable(self, name=None):
-        return ScalarVariable(self, name=name)
+        return ScalarVariable(self, None, name=name)
 
     def __str__(self):
         return str(self.dtype)
@@ -497,7 +498,6 @@ class ScalarType(CType, HasDataType):
         return ""
 
     def c_support_code(self, **kwargs):
-
         if self.dtype.startswith("complex"):
             cplx_types = ["aesara_complex64", "aesara_complex128"]
             real_types = [
@@ -670,10 +670,6 @@ class ScalarType(CType, HasDataType):
         return shape_info
 
 
-# Deprecated alias for backward compatibility
-Scalar = ScalarType
-
-
 def get_scalar_type(dtype, cache: Dict[str, ScalarType] = {}) -> ScalarType:
     """
     Return a ScalarType(dtype) object.
@@ -733,6 +729,12 @@ class _scalar_py_operators:
     dtype = property(lambda self: self.type.dtype)
     """The dtype of this scalar."""
 
+    @property
+    def shape(self):
+        from aesara.tensor.basic import as_tensor_variable
+
+        return as_tensor_variable([], ndim=1, dtype=np.int64)
+
     # UNARY
     def __abs__(self):
         return abs(self)
@@ -791,10 +793,10 @@ class _scalar_py_operators:
         return mul(self, other)
 
     def __truediv__(self, other):
-        return true_div(self, other)
+        return true_divide(self, other)
 
     def __floordiv__(self, other):
-        return int_div(self, other)
+        return floor_divide(self, other)
 
     def __mod__(self, other):
         return mod_check(self, other)
@@ -1078,7 +1080,6 @@ def real_out(type):
 
 
 class ScalarOp(COp):
-
     nin = -1
     nout = 1
 
@@ -1171,7 +1172,7 @@ class ScalarOp(COp):
             if param:
                 return "{}{{{}}}".format(
                     self.__class__.__name__,
-                    ", ".join("{}={}".format(k, v) for k, v in param),
+                    ", ".join(f"{k}={v}" for k, v in param),
                 )
             else:
                 return self.__class__.__name__
@@ -1888,10 +1889,10 @@ class Mul(ScalarOp):
     commutative = True
     associative = True
     nfunc_spec = ("multiply", 2, 1)
-    nfunc_variadic = "product"
+    nfunc_variadic = "prod"
 
     def impl(self, *inputs):
-        return np.product(inputs)
+        return np.prod(inputs)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (z,) = outputs
@@ -1976,7 +1977,7 @@ class Sub(BinaryScalarOp):
 sub = Sub(upcast_out_nobool, name="sub")
 
 
-class TrueDiv(BinaryScalarOp):
+class TrueDivide(BinaryScalarOp):
     nfunc_spec = ("true_divide", 2, 1)
 
     def output_types(self, types):
@@ -2007,7 +2008,6 @@ class TrueDiv(BinaryScalarOp):
         return f"{z} = {x} / {y};"
 
     def grad(self, inputs, gout):
-
         (x, y) = inputs
         (gz,) = gout
         if x.type in complex_types:
@@ -2032,10 +2032,11 @@ class TrueDiv(BinaryScalarOp):
         return first_part, second_part
 
 
-true_div = TrueDiv(upcast_out, name="true_div")
+true_divide = TrueDivide(upcast_out, name="true_divide")
+divide = true_divide
 
 
-class IntDiv(BinaryScalarOp):
+class FloorDivide(BinaryScalarOp):
     nfunc_spec = ("floor_divide", 2, 1)
     complex_error = ComplexError(
         "Aesara does not support integer division (//) on "
@@ -2129,10 +2130,7 @@ class IntDiv(BinaryScalarOp):
         return [inp.zeros_like(dtype=config.floatX) for inp in inputs]
 
 
-int_div = IntDiv(upcast_out, name="int_div")
-
-
-floor_div = int_div
+floor_divide = FloorDivide(upcast_out, name="floor_divide")
 
 
 def mod_check(x, y):
@@ -2390,14 +2388,12 @@ class Second(BinaryScalarOp):
         return f"{z} = {y};"
 
     def connection_pattern(self, node):
-
         # x is never connected because its elements are never used
         # y is connected because its elements are copied over
 
         return [[False], [True]]
 
     def grad(self, inputs, gout):
-
         (x, y) = inputs
         (gz,) = gout
         if y.type in continuous_types:
@@ -2866,8 +2862,8 @@ pprint.assign(add, printing.OperatorPrinter("+", -2, "either"))
 pprint.assign(mul, printing.OperatorPrinter("*", -1, "either"))
 pprint.assign(sub, printing.OperatorPrinter("-", -2, "left"))
 pprint.assign(neg, printing.OperatorPrinter("-", 0, "either"))
-pprint.assign(true_div, printing.OperatorPrinter("/", -1, "left"))
-pprint.assign(int_div, printing.OperatorPrinter("//", -1, "left"))
+pprint.assign(true_divide, printing.OperatorPrinter("/", -1, "left"))
+pprint.assign(floor_divide, printing.OperatorPrinter("//", -1, "left"))
 pprint.assign(pow, printing.OperatorPrinter("**", 1, "right"))
 pprint.assign(mod, printing.OperatorPrinter("%", -1, "left"))
 
@@ -2902,10 +2898,6 @@ class Reciprocal(UnaryScalarOp):
 
 
 reciprocal = Reciprocal(upgrade_to_float, name="reciprocal")
-
-# These are deprecated and will be removed
-Inv = Reciprocal
-inv = reciprocal
 
 
 class Log(UnaryScalarOp):
@@ -3219,7 +3211,7 @@ class Sqr(UnaryScalarOp):
         return f"{z} = {x} * {x};"
 
 
-sqr = Sqr(same_out, name="sqr")
+square = Sqr(same_out, name="square")
 
 
 class Sqrt(UnaryScalarOp):
@@ -3388,7 +3380,7 @@ class ArcCos(UnaryScalarOp):
             else:
                 return [x.zeros_like()]
 
-        return (-gz / sqrt(np.cast[x.type](1) - sqr(x)),)
+        return (-gz / sqrt(np.cast[x.type](1) - square(x)),)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -3462,7 +3454,7 @@ class ArcSin(UnaryScalarOp):
             else:
                 return [x.zeros_like()]
 
-        return (gz / sqrt(np.cast[x.type](1) - sqr(x)),)
+        return (gz / sqrt(np.cast[x.type](1) - square(x)),)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -3498,7 +3490,7 @@ class Tan(UnaryScalarOp):
             else:
                 return [x.zeros_like()]
 
-        return (gz / sqr(cos(x)),)
+        return (gz / square(cos(x)),)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -3534,7 +3526,7 @@ class ArcTan(UnaryScalarOp):
             else:
                 return [x.zeros_like()]
 
-        return (gz / (np.cast[x.type](1) + sqr(x)),)
+        return (gz / (np.cast[x.type](1) + square(x)),)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -3580,7 +3572,10 @@ class ArcTan2(BinaryScalarOp):
 
             # If the output is float, the gradient should flow,
             # even if the inputs are ints
-            return [gz * x / (sqr(x) + sqr(y)), gz * neg(y) / (sqr(x) + sqr(y))]
+            return [
+                gz * x / (square(x) + square(y)),
+                gz * neg(y) / (square(x) + square(y)),
+            ]
 
     def c_code(self, node, name, inputs, outputs, sub):
         (y, x) = inputs
@@ -3657,7 +3652,7 @@ class ArcCosh(UnaryScalarOp):
             else:
                 return [x.zeros_like()]
 
-        return (gz / sqrt(sqr(x) - np.cast[x.type](1)),)
+        return (gz / sqrt(square(x) - np.cast[x.type](1)),)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -3734,7 +3729,7 @@ class ArcSinh(UnaryScalarOp):
             else:
                 return [x.zeros_like()]
 
-        return (gz / sqrt(sqr(x) + np.cast[x.type](1)),)
+        return (gz / sqrt(square(x) + np.cast[x.type](1)),)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -3776,7 +3771,7 @@ class Tanh(UnaryScalarOp):
             else:
                 return [x.zeros_like()]
 
-        return (gz * (1 - sqr(tanh(x))),)
+        return (gz * (1 - square(tanh(x))),)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -3812,7 +3807,7 @@ class ArcTanh(UnaryScalarOp):
             else:
                 return [x.zeros_like()]
 
-        return (gz / (np.cast[x.type](1) - sqr(x)),)
+        return (gz / (np.cast[x.type](1) - square(x)),)
 
     def c_code(self, node, name, inputs, outputs, sub):
         (x,) = inputs
@@ -3989,7 +3984,7 @@ class ComplexFromPolar(BinaryScalarOp):
 complex_from_polar = ComplexFromPolar(name="complex_from_polar")
 
 
-class Composite(ScalarOp):
+class Composite(ScalarOp, HasInnerGraph):
     """
     Composite is an Op that takes a graph of scalar operations and
     produces c code for the whole graph. Its purpose is to implement loop
@@ -4001,9 +3996,65 @@ class Composite(ScalarOp):
 
     init_param: Union[Tuple[str, str], Tuple[str]] = ("inputs", "outputs")
 
+    def __init__(self, inputs, outputs):
+        # We need to clone the graph as sometimes its nodes already
+        # contain a reference to an fgraph. As we want the Composite
+        # to be pickable, we can't have reference to fgraph.
+
+        # Also, if there is Composite in the inner graph, we want to
+        # remove them. In that case, we do a more complicated clone
+        # that will flatten Composite. We don't need to do this
+        # recursively, as the way the fusion optimizer work, we have
+        # only 1 new Composite each time at the output.
+        for i in inputs:
+            assert i not in outputs  # This isn't supported, use identity
+
+        if len(outputs) > 1 or not any(
+            isinstance(var.owner.op, Composite) for var in outputs
+        ):
+            # No inner Composite
+            inputs, outputs = clone(inputs, outputs)
+        else:
+            # Inner Composite that we need to flatten
+            assert len(outputs) == 1
+            # 1. Create a new graph from inputs up to the
+            # Composite
+            res = aesara.compile.rebuild_collect_shared(
+                inputs=inputs, outputs=outputs[0].owner.inputs, copy_inputs_over=False
+            )  # Clone also the inputs
+            # 2. We continue this partial clone with the graph in
+            # the inner Composite
+            res2 = aesara.compile.rebuild_collect_shared(
+                inputs=outputs[0].owner.op.inputs,
+                outputs=outputs[0].owner.op.outputs,
+                replace=dict(zip(outputs[0].owner.op.inputs, res[1])),
+            )
+            assert len(res2[1]) == len(outputs)
+            assert len(res[0]) == len(inputs)
+            assert res[0] != inputs
+            inputs, outputs = res[0], res2[1]
+
+        self.inputs = copy(inputs)
+        self.outputs = copy(outputs)
+        self.inputs_type = tuple([input.type for input in inputs])
+        self.outputs_type = tuple([output.type for output in outputs])
+        self.nin = len(inputs)
+        self.nout = len(outputs)
+        self.prepare_node_called = set()
+
+    @property
+    def fn(self):
+        return None
+
+    @property
+    def inner_inputs(self):
+        return self.fgraph.inputs
+
+    @property
+    def inner_outputs(self):
+        return self.fgraph.outputs
+
     def __str__(self):
-        if self.name is None:
-            self.init_name()
         return self.name
 
     def make_new_inplace(self, output_types_preference=None, name=None):
@@ -4022,17 +4073,186 @@ class Composite(ScalarOp):
         super(Composite, out).__init__(output_types_preference, name)
         return out
 
-    def init_c_code(self):
-        """
-        Assemble the C code for this Composite Op.
+    @property
+    def py_perform(self):
+        if hasattr(self, "_py_perform_fn"):
+            return self._py_perform_fn
 
-        The result is assigned to `self._c_code`.
-        """
+        from aesara.link.utils import fgraph_to_python
+
+        def python_convert(op, node=None, **kwargs):
+            assert node is not None
+
+            n_outs = len(node.outputs)
+
+            if n_outs > 1:
+
+                def _perform(*inputs, outputs=[[None]] * n_outs):
+                    op.perform(node, inputs, outputs)
+                    return tuple(o[0] for o in outputs)
+
+            else:
+
+                def _perform(*inputs, outputs=[[None]]):
+                    op.perform(node, inputs, outputs)
+                    return outputs[0][0]
+
+            return _perform
+
+        self._py_perform_fn = fgraph_to_python(self.fgraph, python_convert)
+        return self._py_perform_fn
+
+    @property
+    def name(self):
+        if hasattr(self, "_name"):
+            return self._name
+
+        # TODO FIXME: Just implement pretty printing for the `Op`; don't do
+        # this redundant, outside work in the `Op` itself.
+        for i, r in enumerate(self.fgraph.inputs):
+            r.name = f"i{int(i)}"
+        for i, r in enumerate(self.fgraph.outputs):
+            r.name = f"o{int(i)}"
+        io = set(self.fgraph.inputs + self.fgraph.outputs)
+        for i, r in enumerate(self.fgraph.variables):
+            if r not in io and len(self.fgraph.clients[r]) > 1:
+                r.name = f"t{int(i)}"
+        outputs_str = ", ".join([pprint(output) for output in self.fgraph.outputs])
+        rval = f"Composite{{{outputs_str}}}"
+        self._name = rval
+        return self._name
+
+    @name.setter
+    def name(self, name):
+        self._name = name
+
+    @property
+    def fgraph(self):
+        if hasattr(self, "_fgraph"):
+            return self._fgraph
+
+        # The clone done by FunctionGraph is needed as we don't want
+        # the fgraph to be set to the variable as we need to pickle
+        # them for the cache of c module to work.
+        fgraph = FunctionGraph(self.inputs, self.outputs)
+        MergeOptimizer().rewrite(fgraph)
+        for node in fgraph.apply_nodes:
+            if not isinstance(node.op, ScalarOp):
+                raise TypeError(
+                    "The fgraph to Composite must be exclusively"
+                    " composed of ScalarOp instances."
+                )
+        self._fgraph = fgraph
+        return self._fgraph
+
+    def prepare_node(self, node, storage_map, compute_map, impl):
+        if impl not in self.prepare_node_called:
+            for n in list_of_nodes(self.inputs, self.outputs):
+                n.op.prepare_node(n, None, None, impl)
+            self.prepare_node_called.add(impl)
+
+    def clone_float32(self):
+        # This will not modify the fgraph or the nodes
+        new_ins, new_outs = composite_f32.apply(self.fgraph)
+        return Composite(new_ins, new_outs)
+
+    def clone(self):
+        new_ins, new_outs = composite_f32.apply(self.fgraph)
+        return Composite(new_ins, new_outs)
+
+    def output_types(self, input_types):
+        # TODO FIXME: What's the intended purpose/use of this method, and why
+        # does it even need to be a method?
+        if tuple(input_types) != self.inputs_type:
+            raise TypeError(
+                f"Wrong types for Composite. Expected {self.inputs_type}, got {tuple(input_types)}."
+            )
+        return self.outputs_type
+
+    def make_node(self, *inputs):
+        if tuple([i.type for i in self.inputs]) == tuple([i.type for i in inputs]):
+            return super().make_node(*inputs)
+        else:
+            # Make a new op with the right input type.
+            assert len(inputs) == self.nin
+            res = aesara.compile.rebuild_collect_shared(
+                self.outputs,
+                replace=dict(zip(self.inputs, inputs)),
+                rebuild_strict=False,
+            )
+            # After rebuild_collect_shared, the Variable in inputs
+            # are not necessarily in the graph represented by res.
+            # res[2][0] is a dict that map from the original variable to the
+            # cloned variable.
+            cloned_inputs = [res[2][0][i] for i in inputs]
+            node = Composite(cloned_inputs, res[1]).make_node(*inputs)
+            return node
+
+    def perform(self, node, inputs, output_storage):
+        outputs = self.py_perform(*inputs)
+        for storage, out_val in zip(output_storage, outputs):
+            storage[0] = out_val
+
+    def impl(self, *inputs):
+        output_storage = [[None] for i in range(self.nout)]
+        self.perform(None, inputs, output_storage)
+        ret = to_return_values([storage[0] for storage in output_storage])
+        if self.nout > 1:
+            ret = tuple(ret)
+        return ret
+
+    def grad(self, inputs, output_grads):
+        raise NotImplementedError("grad is not implemented for Composite")
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if (
+            type(self) != type(other)
+            or self.nin != other.nin
+            or self.nout != other.nout
+        ):
+            return False
+
+        # TODO FIXME: Why this?  Shouldn't we expect equivalent inputs to this
+        # object to generate the same `_c_code`?
+        return self.c_code_template == other.c_code_template
+
+    def __hash__(self):
+        # Note that in general, the configparser settings at the time
+        # of code generation (__init__) affect the semantics of this Op.
+        # This function assumes that all relevant info about the configparser
+        # is embodied in _c_code.  So the _c_code, rather than self.fgraph,
+        # is the signature of the semantics of this Op.
+        # _c_code is preserved through unpickling, so the Op will not change
+        # semantics when it is reloaded with different configparser
+        # settings.
+        #
+        # TODO FIXME: Doesn't the above just mean that we should be including
+        # the relevant "configparser settings" here?  Also, why should we even
+        # care about the exact form of the generated C code when comparing
+        # `Op`s?  All this smells of leaky concerns and interfaces.
+        return hash((type(self), self.nin, self.nout, self.c_code_template))
+
+    def __getstate__(self):
+        rval = dict(self.__dict__)
+        rval.pop("_c_code", None)
+        rval.pop("_py_perform_fn", None)
+        rval.pop("_fgraph", None)
+        rval.pop("prepare_node_called", None)
+        return rval
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+        self.prepare_node_called = set()
+
+    @property
+    def c_code_template(self):
         from aesara.link.c.interface import CLinkerType
 
-        # It was already called
         if hasattr(self, "_c_code"):
-            return
+            return self._c_code
+
         subd = dict(
             chain(
                 ((e, f"%(i{int(i)})s") for i, e in enumerate(self.fgraph.inputs)),
@@ -4080,201 +4300,14 @@ class Composite(ScalarOp):
             )
             _c_code += s
             _c_code += "\n"
+
         _c_code += "}\n"
+
         self._c_code = _c_code
 
-    def init_py_impls(self):
-        """
-        Return a list of functions that compute each output of self.
-
-        """
-        # In the case where the graph is a dag, but not a tree like:
-        # add(*1 -> mul(x, y), *1)
-
-        # We have an efficient way to build the executable (we build
-        # and traverse each node only once).
-
-        # But we don't have an efficient execution. We will execute
-        # like a tree, so nodes that have more then 1 client will be
-        # executed as many times as there number of clients. In the
-        # example above, it will calculate *1 twice. Doing otherwise
-        # imply making a complicated execution engine.
-
-        # We need the fast creation of the executor as we always do it
-        # even if we will use the c code. The Python implementation is
-        # already slow, so it is not as much important to have a fast
-        # execution there.
-
-        memo = {}
-
-        def compose_impl(r):
-            if r in memo:
-                return memo[r]
-            if r in self.fgraph.inputs:
-                idx = self.fgraph.inputs.index(r)
-
-                def f(inputs):
-                    return inputs[idx]
-
-                memo[r] = f
-                return f
-            elif r.owner is None:  # in fgraph.orphans:
-
-                def f(inputs):
-                    return r.data
-
-                memo[r] = f
-                return f
-            node = r.owner
-            producers = [compose_impl(input) for input in node.inputs]
-
-            def f(inputs):
-                return node.op.impl(*[p(inputs) for p in producers])
-
-            memo[r] = f
-            return f
-
-        self._impls = [compose_impl(r) for r in self.fgraph.outputs]
-
-    def init_name(self):
-        """
-        Return a readable string representation of self.fgraph.
-
-        """
-        rval = self.name
-        if rval is None:
-            for i, r in enumerate(self.fgraph.inputs):
-                r.name = f"i{int(i)}"
-            for i, r in enumerate(self.fgraph.outputs):
-                r.name = f"o{int(i)}"
-            io = set(self.fgraph.inputs + self.fgraph.outputs)
-            for i, r in enumerate(self.fgraph.variables):
-                if r not in io and len(self.fgraph.clients[r]) > 1:
-                    r.name = f"t{int(i)}"
-            outputs_str = ", ".join([pprint(output) for output in self.fgraph.outputs])
-            rval = f"Composite{{{outputs_str}}}"
-            self.name = rval
-
-    def init_fgraph(self):
-        # The clone done by FunctionGraph is needed as we don't want
-        # the fgraph to be set to the variable as we need to pickle
-        # them for the cache of c module to work.
-        fgraph = FunctionGraph(self.inputs, self.outputs)
-        MergeOptimizer().optimize(fgraph)
-        for node in fgraph.apply_nodes:
-            if not isinstance(node.op, ScalarOp):
-                raise ValueError(
-                    "The fgraph to Composite must be exclusively"
-                    " composed of ScalarOp instances."
-                )
-        self.fgraph = fgraph
-
-    def __init__(self, inputs, outputs):
-        # We need to clone the graph as sometimes its nodes already
-        # contain a reference to an fgraph. As we want the Composite
-        # to be pickable, we can't have reference to fgraph.
-
-        # Also, if there is Composite in the inner graph, we want to
-        # remove them. In that case, we do a more complicated clone
-        # that will flatten Composite. We don't need to do this
-        # recursively, as the way the fusion optimizer work, we have
-        # only 1 new Composite each time at the output.
-        for i in inputs:
-            assert i not in outputs  # This isn't supported, use identity
-        if len(outputs) > 1 or not any(
-            isinstance(var.owner.op, Composite) for var in outputs
-        ):
-            # No inner Composite
-            inputs, outputs = clone(inputs, outputs)
-        else:
-            # Inner Composite that we need to flatten
-            assert len(outputs) == 1
-            # 1. Create a new graph from inputs up to the
-            # Composite
-            res = aesara.compile.rebuild_collect_shared(
-                inputs=inputs, outputs=outputs[0].owner.inputs, copy_inputs_over=False
-            )  # Clone also the inputs
-            # 2. We continue this partial clone with the graph in
-            # the inner Composite
-            res2 = aesara.compile.rebuild_collect_shared(
-                inputs=outputs[0].owner.op.inputs,
-                outputs=outputs[0].owner.op.outputs,
-                replace=dict(zip(outputs[0].owner.op.inputs, res[1])),
-            )
-            assert len(res2[1]) == len(outputs)
-            assert len(res[0]) == len(inputs)
-            assert res[0] != inputs
-            inputs, outputs = res[0], res2[1]
-
-        self.inputs = copy(inputs)
-        self.outputs = copy(outputs)
-        self.inputs_type = tuple([input.type for input in inputs])
-        self.outputs_type = tuple([output.type for output in outputs])
-        self.nin = len(inputs)
-        self.nout = len(outputs)
-        self.init_fgraph()  # self.fgraph
-        # Postpone the creation in case it isn't needed.
-        #  self.init_name()      # self.name
-        self.name = None
-        self.prepare_node_called = set()
-
-    def prepare_node(self, node, storage_map, compute_map, impl):
-        if impl == "py":
-            self.init_py_impls()  # self._impls
-        if impl not in self.prepare_node_called:
-            for n in list_of_nodes(self.inputs, self.outputs):
-                n.op.prepare_node(n, None, None, impl)
-            self.prepare_node_called.add(impl)
-
-    def clone_float32(self):
-        # This will not modify the fgraph or the nodes
-        new_ins, new_outs = composite_f32.apply(self.fgraph)
-        return Composite(new_ins, new_outs)
-
-    def output_types(self, input_types):
-        if tuple(input_types) != self.inputs_type:
-            raise TypeError(
-                f"Wrong types for Composite. Expected {self.inputs_type}, got {tuple(input_types)}."
-            )
-        return self.outputs_type
-
-    def make_node(self, *inputs):
-        if tuple([i.type for i in self.inputs]) == tuple([i.type for i in inputs]):
-            return super().make_node(*inputs)
-        else:
-            # Make a new op with the right input type.
-            assert len(inputs) == self.nin
-            res = aesara.compile.rebuild_collect_shared(
-                self.outputs,
-                replace=dict(zip(self.inputs, inputs)),
-                rebuild_strict=False,
-            )
-            # After rebuild_collect_shared, the Variable in inputs
-            # are not necessarily in the graph represented by res.
-            # res[2][0] is a dict that map from the original variable to the
-            # cloned variable.
-            cloned_inputs = [res[2][0][i] for i in inputs]
-            node = Composite(cloned_inputs, res[1]).make_node(*inputs)
-            return node
-
-    def perform(self, node, inputs, output_storage):
-        for storage, impl in zip(output_storage, self._impls):
-            storage[0] = impl(inputs)
-
-    def impl(self, *inputs):
-        output_storage = [[None] for i in range(self.nout)]
-        self.perform(None, inputs, output_storage)
-        ret = to_return_values([storage[0] for storage in output_storage])
-        if self.nout > 1:
-            ret = tuple(ret)
-        return ret
-
-    def grad(self, inputs, output_grads):
-        raise NotImplementedError("grad is not implemented for Composite")
+        return self._c_code
 
     def c_code(self, node, nodename, inames, onames, sub):
-        self.init_c_code()
-
         d = dict(
             chain(
                 zip((f"i{int(i)}" for i in range(len(inames))), inames),
@@ -4288,7 +4321,7 @@ class Composite(ScalarOp):
             # It won't generate conflicting variable name.
             d["id"] = "_DUMMY_ID_"
 
-        return self._c_code % d
+        return self.c_code_template % d
 
     def c_code_cache_version(self):
         rval = [3]
@@ -4316,7 +4349,6 @@ class Composite(ScalarOp):
         return "\n".join(sorted(rval))
 
     def c_support_code_apply(self, node, name):
-        self.init_c_code()
         rval = []
         for subnode, subnodename in zip(self.fgraph.toposort(), self.nodenames):
             subnode_support_code = subnode.op.c_support_code_apply(
@@ -4329,49 +4361,6 @@ class Composite(ScalarOp):
         # Any block that isn't specialized should be returned via
         # c_support_code instead of c_support_code_apply.
         return "\n".join(rval)
-
-    def __eq__(self, other):
-        if self is other:
-            return True
-        if (
-            type(self) != type(other)
-            or self.nin != other.nin
-            or self.nout != other.nout
-        ):
-            return False
-        # see __hash__ for comment on why there is no mention of fgraph
-        # or module cache key here.
-        self.init_c_code()  # self._c_code and self.nodenames
-        other.init_c_code()
-        return self._c_code == other._c_code
-
-    def __hash__(self):
-        self.init_c_code()  # self._c_code and self.nodenames
-        rval = hash((type(self), self.nin, self.nout, self._c_code))
-        # Note that in general, the configparser settings at the time
-        # of code generation (__init__) affect the semantics of this Op.
-        # This function assumes that all relevant info about the configparser
-        # is embodied in _c_code.  So the _c_code, rather than self.fgraph,
-        # is the signature of the semantics of this Op.
-        # _c_code is preserved through unpickling, so the Op will not change
-        # semantics when it is reloaded with different configparser
-        # settings.
-        return rval
-
-    def __getstate__(self):
-        rval = dict(self.__dict__)
-        rval.pop("_impls", None)
-        rval.pop("prepare_node_called", None)
-        del rval["fgraph"]
-        return rval
-
-    def __setstate__(self, d):
-        self.__dict__.update(d)
-        # We must call init to set fgraph and _impls again, as otherwise
-        # self.perform will not work.
-        self.prepare_node_called = set()
-        self.init_fgraph()
-        self.init_py_impls()
 
 
 class Compositef32:
@@ -4455,3 +4444,268 @@ def handle_composite(node, mapping):
 
 
 Compositef32.special[Composite] = handle_composite
+
+
+DEPRECATED_NAMES: List[Tuple[str, str, object]] = [
+    ("Inv", "`Inv` is deprecated; use `Reciprocal` instead.", Reciprocal),
+    ("inv", "`inv` is deprecated; use `reciprocal` instead.", reciprocal),
+    ("Scalar", "`Scalar` is deprecated; use `ScalarType` instead.", ScalarType),
+    (
+        "true_div",
+        "`true_div` is deprecated; use `true_divide` or `divide` instead.",
+        true_divide,
+    ),
+    ("int_div", "`int_div` is deprecated; use `floor_divide` instead.", floor_divide),
+    (
+        "floor_div",
+        "`floor_div` is deprecated; use `floor_divide` instead.",
+        floor_divide,
+    ),
+    ("sqr", "`sqr` is deprecated; use `square` instead.", square),
+]
+
+
+def __getattr__(name):
+    """Intercept module-level attribute access of deprecated symbols.
+
+    Adapted from https://stackoverflow.com/a/55139609/3006474.
+
+    """
+    from warnings import warn
+
+    for old_name, msg, old_object in DEPRECATED_NAMES:
+        if name == old_name:
+            warn(msg, DeprecationWarning, stacklevel=2)
+            return old_object
+
+    raise AttributeError(f"module {__name__} has no attribute {name}")
+
+
+__all__ = [
+    "constant",
+    "as_scalar",
+    "ComplexError",
+    "IntegerDivisionError",
+    "upcast",
+    "as_common_dtype",
+    "NumpyAutocaster",
+    "autocast_float_as",
+    "convert",
+    "ScalarType",
+    "get_scalar_type",
+    "ScalarVariable",
+    "ScalarConstant",
+    "upcast_out",
+    "upcast_out_nobool",
+    "upcast_out_min8",
+    "upcast_out_no_complex",
+    "same_out_float_only",
+    "transfer_type",
+    "specific_out",
+    "int_out",
+    "float_out",
+    "upgrade_to_float_no_complex",
+    "same_out_nocomplex",
+    "int_out_nocomplex",
+    "float_out_nocomplex",
+    "unary_out_lookup",
+    "real_out",
+    "ScalarOp",
+    "UnaryScalarOp",
+    "BinaryScalarOp",
+    "LogicalComparison",
+    "FixedLogicalComparison",
+    "LT",
+    "GT",
+    "LE",
+    "GE",
+    "EQ",
+    "NEQ",
+    "IsNan",
+    "IsInf",
+    "InRange",
+    "Switch",
+    "UnaryBitOp",
+    "BinaryBitOp",
+    "OR",
+    "XOR",
+    "AND",
+    "Invert",
+    "ScalarMaximum",
+    "ScalarMinimum",
+    "Add",
+    "Mean",
+    "Mul",
+    "Sub",
+    "TrueDivide",
+    "FloorDivide",
+    "mod_check",
+    "Mod",
+    "Pow",
+    "Clip",
+    "Second",
+    "Identity",
+    "Cast",
+    "cast",
+    "Abs",
+    "Sgn",
+    "Ceil",
+    "Floor",
+    "Trunc",
+    "RoundHalfToEven",
+    "round_half_away_from_zero_",
+    "round_half_away_from_zero_vec",
+    "RoundHalfAwayFromZero",
+    "Neg",
+    "Reciprocal",
+    "Log",
+    "Log2",
+    "Log10",
+    "Log1p",
+    "Exp",
+    "Exp2",
+    "Expm1",
+    "Sqr",
+    "Sqrt",
+    "Deg2Rad",
+    "Rad2Deg",
+    "Cos",
+    "ArcCos",
+    "Sin",
+    "ArcSin",
+    "Tan",
+    "ArcTan",
+    "ArcTan2",
+    "Cosh",
+    "ArcCosh",
+    "Sinh",
+    "ArcSinh",
+    "Tanh",
+    "ArcTanh",
+    "Real",
+    "Imag",
+    "Angle",
+    "Complex",
+    "Conj",
+    "ComplexFromPolar",
+    "Composite",
+    "Compositef32",
+    "handle_cast",
+    "handle_composite",
+    "autocast_int",
+    "autocast_float",
+    "bool",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "float16",
+    "float32",
+    "float64",
+    "complex64",
+    "complex128",
+    "int_types",
+    "uint_types",
+    "float_types",
+    "complex_types",
+    "integer_types",
+    "discrete_types",
+    "continuous_types",
+    "all_types",
+    "discrete_dtypes",
+    "ints",
+    "floats",
+    "complexs",
+    "complexs64",
+    "complexs128",
+    "lt",
+    "gt",
+    "le",
+    "ge",
+    "eq",
+    "neq",
+    "isnan",
+    "isinf",
+    "inopenrange",
+    "inclosedrange",
+    "switch",
+    "or_",
+    "xor",
+    "and_",
+    "invert",
+    "scalar_maximum",
+    "scalar_minimum",
+    "add",
+    "mean",
+    "mul",
+    "sub",
+    "true_divide",
+    "divide",
+    "floor_divide",
+    "mod",
+    "pow",
+    "clip",
+    "second",
+    "identity",
+    "_cast_mapping",
+    "convert_to_bool",
+    "convert_to_int8",
+    "convert_to_int16",
+    "convert_to_int32",
+    "convert_to_int64",
+    "convert_to_uint8",
+    "convert_to_uint16",
+    "convert_to_uint32",
+    "convert_to_uint64",
+    "convert_to_float16",
+    "convert_to_float32",
+    "convert_to_float64",
+    "convert_to_complex64",
+    "convert_to_complex128",
+    "abs",
+    "sgn",
+    "ceil",
+    "floor",
+    "trunc",
+    "round_half_to_even",
+    "round_half_away_from_zero_vec64",
+    "round_half_away_from_zero_vec32",
+    "round_half_away_from_zero",
+    "neg",
+    "reciprocal",
+    "log",
+    "log2",
+    "log10",
+    "log1p",
+    "exp",
+    "exp2",
+    "expm1",
+    "square",
+    "sqrt",
+    "deg2rad",
+    "rad2deg",
+    "cos",
+    "arccos",
+    "sin",
+    "arcsin",
+    "tan",
+    "arctan",
+    "arctan2",
+    "cosh",
+    "arccosh",
+    "sinh",
+    "arcsinh",
+    "tanh",
+    "arctanh",
+    "real",
+    "imag",
+    "angle",
+    "complex",
+    "conj",
+    "complex_from_polar",
+    "composite_f32",
+]

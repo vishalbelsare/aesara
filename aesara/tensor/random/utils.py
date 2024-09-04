@@ -1,11 +1,10 @@
 from collections.abc import Sequence
-from functools import wraps
+from functools import partial, wraps
 from itertools import zip_longest
 from types import ModuleType
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Callable, Literal, Optional, Union
 
 import numpy as np
-from typing_extensions import Literal
 
 from aesara.compile.sharedvalue import shared
 from aesara.graph.basic import Constant, Variable
@@ -16,10 +15,6 @@ from aesara.tensor.math import maximum
 from aesara.tensor.shape import specify_shape
 from aesara.tensor.type import int_dtypes
 from aesara.tensor.var import TensorVariable
-
-
-if TYPE_CHECKING:
-    from aesara.tensor.random.op import RandomVariable
 
 
 def params_broadcast_shapes(param_shapes, ndims_params, use_aesara=True):
@@ -188,7 +183,6 @@ class RandomStream:
         self.gen_seedgen = np.random.SeedSequence(seed)
 
         if isinstance(rng_ctor, type) and issubclass(rng_ctor, np.random.RandomState):
-
             # The legacy state does not accept `SeedSequence`s directly
             def rng_ctor(seed):
                 return np.random.RandomState(np.random.MT19937(seed))
@@ -196,24 +190,25 @@ class RandomStream:
         self.rng_ctor = rng_ctor
 
     def __getattr__(self, obj):
-
         ns_obj = next(
             (getattr(ns, obj) for ns in self.namespaces if hasattr(ns, obj)), None
         )
 
         if ns_obj is None:
-            raise AttributeError("No attribute {}.".format(obj))
+            raise AttributeError(f"No attribute {obj}.")
 
         from aesara.tensor.random.op import RandomVariable
 
-        if isinstance(ns_obj, RandomVariable):
+        if isinstance(ns_obj, RandomVariable) or (
+            isinstance(ns_obj, partial) and isinstance(ns_obj.func, RandomVariable)
+        ):
 
             @wraps(ns_obj)
             def meta_obj(*args, **kwargs):
                 return self.gen(ns_obj, *args, **kwargs)
 
         else:
-            raise AttributeError("No attribute {}.".format(obj))
+            raise AttributeError(f"No attribute {obj}.")
 
         setattr(self, obj, meta_obj)
         return getattr(self, obj)
@@ -245,13 +240,13 @@ class RandomStream:
         for (old_r, new_r), old_r_seed in zip(self.state_updates, old_r_seeds):
             old_r.set_value(self.rng_ctor(old_r_seed), borrow=True)
 
-    def gen(self, op: "RandomVariable", *args, **kwargs) -> TensorVariable:
+    def gen(self, op: Callable, *args, **kwargs) -> TensorVariable:
         r"""Generate a draw from `op` seeded from this `RandomStream`.
 
         Parameters
         ----------
         op
-            A `RandomVariable` instance
+            A callable that creates a `RandomVariable`/sampler graph.
         args
             Positional arguments passed to `op`.
         kwargs

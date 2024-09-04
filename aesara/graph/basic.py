@@ -6,11 +6,13 @@ from copy import copy
 from itertools import count
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Collection,
     Deque,
     Dict,
     Generator,
+    Generic,
     Hashable,
     Iterable,
     Iterator,
@@ -45,6 +47,11 @@ if TYPE_CHECKING:
     from aesara.graph.type import Type
 
 
+OpType = TypeVar("OpType", bound="Op")
+OptionalApplyType = TypeVar("OptionalApplyType", None, "Apply", covariant=True)
+_TypeType = TypeVar("_TypeType", bound="Type")
+_IdType = TypeVar("_IdType", bound=Hashable)
+
 T = TypeVar("T", bound="Node")
 NoParams = object()
 NodeAndChildren = Tuple[T, Optional[Iterable[T]]]
@@ -58,7 +65,6 @@ class Node(MetaObject):
     keeps track of its parents via `Variable.owner` / `Apply.inputs`.
 
     """
-    type: "Type"
     name: Optional[str]
 
     def get_parents(self):
@@ -71,7 +77,7 @@ class Node(MetaObject):
         raise NotImplementedError()
 
 
-class Apply(Node):
+class Apply(Node, Generic[OpType]):
     """A `Node` representing the application of an operation to inputs.
 
     Basically, an `Apply` instance is an object that represents the
@@ -107,13 +113,16 @@ class Apply(Node):
     """
 
     def __init__(
-        self, op: "Op", inputs: Sequence["Variable"], outputs: Sequence["Variable"]
+        self,
+        op: OpType,
+        inputs: Sequence["Variable"],
+        outputs: Sequence["Variable"],
     ):
-        if not isinstance(inputs, (list, tuple)):
-            raise TypeError("The inputs of an Apply must be a list or tuple")
+        if not isinstance(inputs, Sequence):
+            raise TypeError("The inputs of an Apply must be a sequence type")
 
-        if not isinstance(outputs, (list, tuple)):
-            raise TypeError("The output of an Apply must be a list or tuple")
+        if not isinstance(outputs, Sequence):
+            raise TypeError("The output of an Apply must be a sequence type")
 
         self.op = op
         self.inputs: List[Variable] = []
@@ -197,7 +206,7 @@ class Apply(Node):
     def __repr__(self):
         return str(self)
 
-    def clone(self, clone_inner_graph: bool = False) -> "Apply":
+    def clone(self, clone_inner_graph: bool = False) -> "Apply[OpType]":
         r"""Clone this `Apply` instance.
 
         Parameters
@@ -218,8 +227,8 @@ class Apply(Node):
 
         new_op = self.op
 
-        if isinstance(new_op, HasInnerGraph) and clone_inner_graph:
-            new_op = new_op.clone()
+        if isinstance(new_op, HasInnerGraph) and clone_inner_graph:  # type: ignore
+            new_op = new_op.clone()  # type: ignore
 
         cp = self.__class__(
             new_op, self.inputs, [output.clone() for output in self.outputs]
@@ -229,7 +238,7 @@ class Apply(Node):
 
     def clone_with_new_inputs(
         self, inputs: Sequence["Variable"], strict=True, clone_inner_graph=False
-    ) -> "Apply":
+    ) -> "Apply[OpType]":
         r"""Duplicate this `Apply` instance in a new graph.
 
         Parameters
@@ -273,8 +282,8 @@ class Apply(Node):
         if remake_node:
             new_op = self.op
 
-            if isinstance(new_op, HasInnerGraph) and clone_inner_graph:
-                new_op = new_op.clone()
+            if isinstance(new_op, HasInnerGraph) and clone_inner_graph:  # type: ignore
+                new_op = new_op.clone()  # type: ignore
 
             new_node = new_op.make_node(*new_inputs)
             new_node.tag = copy(self.tag).__update__(new_node.tag)
@@ -306,7 +315,7 @@ class Apply(Node):
         return self.op.params_type
 
 
-class Variable(Node):
+class Variable(Node, Generic[_TypeType, OptionalApplyType]):
     r"""
     A :term:`Variable` is a node in an expression graph that represents a
     variable.
@@ -404,10 +413,10 @@ class Variable(Node):
     # __slots__ = ['type', 'owner', 'index', 'name']
     __count__ = count(0)
 
-    _owner: Optional[Apply]
+    _owner: OptionalApplyType
 
     @property
-    def owner(self) -> Optional[Apply]:
+    def owner(self) -> OptionalApplyType:
         return self._owner
 
     @owner.setter
@@ -424,30 +433,31 @@ class Variable(Node):
 
     def __init__(
         self,
-        type,
-        owner: Optional[Apply] = None,
+        type: _TypeType,
+        owner: OptionalApplyType,
         index: Optional[int] = None,
         name: Optional[str] = None,
-    ):
+    ) -> None:
         super().__init__()
 
         self.tag = ValidatingScratchpad("test_value", type.filter)
 
         self.type = type
 
+        self._owner = owner
+
         if owner is not None and not isinstance(owner, Apply):
-            raise TypeError("owner must be an Apply instance", owner)
-        self.owner = owner
+            raise TypeError("owner must be an Apply instance")
 
         if index is not None and not isinstance(index, int):
-            raise TypeError("index must be an int", index)
+            raise TypeError("index must be an int")
         self.index = index
 
         if name is not None and not isinstance(name, str):
-            raise TypeError("name must be a string", name)
+            raise TypeError("name must be a string")
         self.name = name
 
-        self.auto_name = "auto_" + str(next(self.__count__))
+        self.auto_name = f"auto_{next(self.__count__)}"
 
     def get_test_value(self):
         """Get the test value.
@@ -500,8 +510,13 @@ class Variable(Node):
                 pass
         return "\n".join(to_print)
 
-    def clone(self):
+    def clone(self, **kwargs):
         """Return a new, un-owned `Variable` like `self`.
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Optional "name" keyword argument for the copied instance. Same as `self.name` if value not provided.
 
         Returns
         -------
@@ -513,8 +528,8 @@ class Variable(Node):
         Tags and names are copied to the returned instance.
 
         """
-        # return copy(self)
-        cp = self.__class__(self.type, None, None, self.name)
+        name = kwargs.pop("name", self.name)
+        cp = self.__class__(type=self.type, owner=None, index=None, name=name, **kwargs)
         cp.tag = copy(self.tag)
         return cp
 
@@ -609,11 +624,11 @@ class Variable(Node):
         return d
 
 
-class AtomicVariable(Variable):
+class AtomicVariable(Variable[_TypeType, None]):
     """A node type that has no ancestors and should never be considered an input to a graph."""
 
-    def __init__(self, type, **kwargs):
-        super().__init__(type, **kwargs)
+    def __init__(self, type: _TypeType, name: Optional[str] = None, **kwargs):
+        super().__init__(type=type, owner=None, index=None, name=name, **kwargs)
 
     @abc.abstractmethod
     def signature(self):
@@ -647,14 +662,20 @@ class AtomicVariable(Variable):
         if value is not None:
             raise ValueError("AtomicVariable instances cannot have an index.")
 
+    def clone(self, **kwargs):
+        name = kwargs.pop("name", self.name)
+        cp = self.__class__(type=self.type, name=name, **kwargs)
+        cp.tag = copy(self.tag)
+        return cp
 
-class NominalVariable(AtomicVariable):
+
+class NominalVariable(AtomicVariable[_TypeType]):
     """A variable that enables alpha-equivalent comparisons."""
 
-    __instances__: Dict[Hashable, type] = {}
+    __instances__: Dict[Tuple["Type", Hashable], "NominalVariable"] = {}
 
-    def __new__(cls, id, typ, **kwargs):
-        if (id, typ) not in cls.__instances__:
+    def __new__(cls, id: _IdType, typ: _TypeType, **kwargs):
+        if (typ, id) not in cls.__instances__:
             var_type = typ.variable_type
             type_name = f"Nominal{var_type.__name__}"
 
@@ -667,18 +688,19 @@ class NominalVariable(AtomicVariable):
             new_type = type(
                 type_name, (cls, var_type), {"__reduce__": _reduce, "__str__": _str}
             )
-            res = super().__new__(new_type)
+            res: NominalVariable = super().__new__(new_type)
 
-            cls.__instances__[(id, typ)] = res
+            cls.__instances__[(typ, id)] = res
 
-        return cls.__instances__[(id, typ)]
+        return cls.__instances__[(typ, id)]
 
-    def __init__(self, id, typ, **kwargs):
+    def __init__(self, id: _IdType, typ: _TypeType, name: Optional[str] = None):
         self.id = id
-        super().__init__(typ, **kwargs)
+        super().__init__(type=typ, name=name)
 
-    def clone(self):
-        return self
+    def clone(self, **kwargs):
+        name = kwargs.pop("name", self.name)
+        return self.__class__(id=self.id, typ=self.type, name=name, **kwargs)
 
     def __eq__(self, other):
         if self is other:
@@ -696,11 +718,11 @@ class NominalVariable(AtomicVariable):
     def __repr__(self):
         return f"{type(self).__name__}({repr(self.id)}, {repr(self.type)})"
 
-    def signature(self):
+    def signature(self) -> Tuple[_TypeType, _IdType]:
         return (self.type, self.id)
 
 
-class Constant(AtomicVariable):
+class Constant(AtomicVariable[_TypeType]):
     """A `Variable` with a fixed `data` field.
 
     `Constant` nodes make numerous optimizations possible (e.g. constant
@@ -715,7 +737,7 @@ class Constant(AtomicVariable):
 
     # __slots__ = ['data']
 
-    def __init__(self, type, data, name=None):
+    def __init__(self, type: _TypeType, data: Any, name: Optional[str] = None):
         super().__init__(type, name=name)
         self.data = type.filter(data)
         add_tag_trace(self)
@@ -735,8 +757,7 @@ class Constant(AtomicVariable):
                 name = name[:10] + "..." + name[-10:]
             return f"{type(self).__name__}{{{name}}}"
 
-    def clone(self):
-        """Return `self`, because there's no reason to clone a constant."""
+    def clone(self, **kwargs):
         return self
 
     @property
@@ -802,7 +823,6 @@ def walk(
         node_hash: int = hash_fn(node)
 
         if node_hash not in rval_set:
-
             rval_set.add(node_hash)
 
             new_nodes: Optional[Iterable[T]] = expand(node)
@@ -1060,6 +1080,7 @@ def clone_get_equiv(
         Dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]
     ] = None,
     clone_inner_graphs: bool = False,
+    **kwargs,
 ) -> Dict[Union[Apply, Variable, "Op"], Union[Apply, Variable, "Op"]]:
     r"""Clone the graph between `inputs` and `outputs` and return a map of the cloned objects.
 
@@ -1090,6 +1111,8 @@ def clone_get_equiv(
         dictionary and return it.
     clone_inner_graphs
         If ``True``, clone `HasInnerGraph` `Op`\s and their inner-graphs.
+    kwargs
+        Keywords passed to `Apply.clone_with_new_inputs`.
 
     """
     if memo is None:
@@ -1115,7 +1138,9 @@ def clone_get_equiv(
                 else:
                     memo[input] = input
 
-        clone_node_and_cache(apply, memo, clone_inner_graphs=clone_inner_graphs)
+        clone_node_and_cache(
+            apply, memo, clone_inner_graphs=clone_inner_graphs, **kwargs
+        )
 
     # finish up by cloning any remaining outputs (it can happen)
     for output in outputs:
@@ -1158,11 +1183,9 @@ def clone_replace(
         items = []
     else:
         raise ValueError(
-            (
-                "replace is neither a dictionary, list, "
-                f"tuple or None ! The value provided is {replace},"
-                f"of type {type(replace)}"
-            )
+            "replace is neither a dictionary, list, "
+            f"tuple or None ! The value provided is {replace},"
+            f"of type {type(replace)}"
         )
     tmp_replace = [(x, x.type()) for x, y in items]
     new_replace = [(x, y) for ((_, x), (_, y)) in zip(tmp_replace, items)]
@@ -1215,7 +1238,6 @@ def general_toposort(
 
     """
     if compute_deps_cache is None:
-
         if deps_cache is None:
             deps_cache = {}
 
@@ -1352,7 +1374,6 @@ def io_toposort(
             return rval
 
     else:
-
         # the inputs are used only here in the function that decides what
         # 'predecessors' to explore
         def compute_deps(obj):
@@ -1403,7 +1424,6 @@ def io_connection_pattern(inputs, outputs):
     # inputs and, for every node, infer their connection pattern to
     # every input from the connection patterns of their parents.
     for n in inner_nodes:
-
         # Get the connection pattern of the inner node's op. If the op
         # does not define a connection_pattern method, assume that
         # every node output is connected to every node input
@@ -1662,14 +1682,14 @@ def equal_computations(
 
     for x, y in zip(xs, ys):
         if not isinstance(x, Variable) and not isinstance(y, Variable):
-            return cast(bool, np.array_equal(x, y))
+            return np.array_equal(x, y)
         if not isinstance(x, Variable):
             if isinstance(y, Constant):
-                return cast(bool, np.array_equal(y.data, x))
+                return np.array_equal(y.data, x)
             return False
         if not isinstance(y, Variable):
             if isinstance(x, Constant):
-                return cast(bool, np.array_equal(x.data, y))
+                return np.array_equal(x.data, y)
             return False
         if x.owner and not y.owner:
             return False
@@ -1738,7 +1758,6 @@ def equal_computations(
             # Compare the individual inputs for equality
             for dx, dy in zip(nd_x.inputs, nd_y.inputs):
                 if (dx, dy) not in common:
-
                     # Equality between the variables is unknown, compare
                     # their respective owners, if they have some
                     if (
@@ -1746,7 +1765,6 @@ def equal_computations(
                         and dy.owner
                         and dx.owner.outputs.index(dx) == dy.owner.outputs.index(dy)
                     ):
-
                         nodes_equal = compare_nodes(
                             dx.owner, dy.owner, common, different
                         )
@@ -1757,7 +1775,6 @@ def equal_computations(
                     # If both variables don't have an owner, then they are
                     # inputs and can be directly compared
                     elif dx.owner is None and dy.owner is None:
-
                         if dx != dy:
                             if isinstance(dx, Constant) and isinstance(dy, Constant):
                                 if not dx.equals(dy):

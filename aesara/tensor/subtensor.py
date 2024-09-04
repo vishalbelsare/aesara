@@ -20,7 +20,7 @@ from aesara.misc.safe_asarray import _asarray
 from aesara.printing import Printer, pprint, set_precedence
 from aesara.scalar.basic import ScalarConstant
 from aesara.tensor import _get_vector_length, as_tensor_variable, get_vector_length
-from aesara.tensor.basic import addbroadcast, alloc, get_scalar_constant_value
+from aesara.tensor.basic import alloc, get_scalar_constant_value
 from aesara.tensor.elemwise import DimShuffle
 from aesara.tensor.exceptions import (
     AdvancedIndexingError,
@@ -28,7 +28,7 @@ from aesara.tensor.exceptions import (
     ShapeError,
 )
 from aesara.tensor.math import clip
-from aesara.tensor.shape import Reshape
+from aesara.tensor.shape import Reshape, specify_broadcastable
 from aesara.tensor.type import (
     TensorType,
     bscalar,
@@ -41,6 +41,10 @@ from aesara.tensor.type import (
     iscalar,
     lscalar,
     tensor,
+    ubscalar,
+    uiscalar,
+    ulscalar,
+    uwscalar,
     wscalar,
     zscalar,
 )
@@ -50,12 +54,25 @@ from aesara.tensor.type_other import NoneConst, NoneTypeT, SliceType, make_slice
 _logger = logging.getLogger("aesara.tensor.subtensor")
 
 invalid_scal_types = (aes.float64, aes.float32, aes.float16)
-scal_types = (aes.int64, aes.int32, aes.int16, aes.int8)
+scal_types = (
+    aes.int64,
+    aes.int32,
+    aes.int16,
+    aes.int8,
+    aes.uint64,
+    aes.uint32,
+    aes.uint16,
+    aes.uint8,
+)
 tensor_types = (
     lscalar,
     iscalar,
     wscalar,
     bscalar,
+    ulscalar,
+    uiscalar,
+    uwscalar,
+    ubscalar,
 )
 invalid_tensor_types = (
     fscalar,
@@ -376,7 +393,7 @@ def slice_len(slc, n):
 def is_basic_idx(idx):
     """Determine if an index is of the NumPy basic type.
 
-    XXX: This only checks a single index, so an integers is *not* considered a
+    XXX: This only checks a single index, so an integer is *not* considered a
     basic index, because--depending on the other indices its used with--an
     integer can indicate advanced indexing.
 
@@ -707,10 +724,11 @@ class Subtensor(COp):
         padded = get_constant_idx(
             self.idx_list, (None,) + inputs, allow_partial=True
         ) + [slice(None, None, None)] * (x.type.ndim - len(idx_list))
-        broadcastable = []
-        for i, (p, bc) in enumerate(zip(padded, x.type.broadcastable)):
+
+        out_shape = []
+        for i, (p, s) in enumerate(zip(padded, x.type.shape)):
             if isinstance(p, slice):
-                if bc:
+                if s == 1:
                     start = p.start
                     try:
                         start = get_scalar_constant_value(start)
@@ -724,15 +742,15 @@ class Subtensor(COp):
                             isinstance(p.stop, (int, np.integer, np.ndarray))
                             and p.stop > start
                         ):
-                            broadcastable.append(True)
+                            out_shape.append(1)
                             continue
 
-                broadcastable.append(False)
+                out_shape.append(None)
 
         return Apply(
             self,
             (x,) + inputs,
-            [tensor(dtype=x.type.dtype, shape=broadcastable)],
+            [tensor(dtype=x.type.dtype, shape=out_shape)],
         )
 
     def perform(self, node, inputs, out_):
@@ -795,7 +813,6 @@ class Subtensor(COp):
         return [first] + [DisconnectedType()()] * len(rest)
 
     def connection_pattern(self, node):
-
         rval = [[True]]
 
         for ipt in node.inputs[1:]:
@@ -1322,8 +1339,8 @@ def inc_subtensor(
             # It is acceptable to try to increment a subtensor with a
             # broadcastable dim with a tensor that is not broadcastable
             # on that dimension. However, its length must then be 1.
-            # We insert a Rebroadcast Op to make sure it is the case.
-            y = addbroadcast(y, dim)
+            # We insert a SpecifyShape Op to make sure it is the case.
+            y = specify_broadcastable(y, dim)
 
     if not x.owner:
         raise TypeError("x must be the result of a subtensor operation")
@@ -1573,7 +1590,6 @@ class IncSubtensor(COp):
         out[0] = x
 
     def c_code(self, node, name, inputs, outputs, sub):
-
         # This method delegates much of the work to helper
         # methods. This method implements the main logic
         # but subclasses may override the helper methods
@@ -1818,7 +1834,6 @@ class IncSubtensor(COp):
         return self(eval_points[0], eval_points[1], *inputs[2:], return_list=True)
 
     def connection_pattern(self, node):
-
         rval = [[True], [True]]
 
         for ipt in node.inputs[2:]:
@@ -1931,8 +1946,9 @@ class AdvancedSubtensor1(COp):
             raise TypeError("index must be vector")
         if x_.type.ndim == 0:
             raise TypeError("cannot index into a scalar")
-        bcast = (ilist_.broadcastable[0],) + x_.broadcastable[1:]
-        return Apply(self, [x_, ilist_], [TensorType(dtype=x.dtype, shape=bcast)()])
+        out_shape = (ilist_.type.shape[0],) + x_.type.shape[1:]
+        out_shape = tuple(1 if s == 1 else None for s in out_shape)
+        return Apply(self, [x_, ilist_], [TensorType(dtype=x.dtype, shape=out_shape)()])
 
     def perform(self, node, inp, out_):
         x, i = inp
@@ -2452,7 +2468,6 @@ class AdvancedIncSubtensor1(COp):
         return self.make_node(eval_points[0], eval_points[1], *inputs[2:]).outputs
 
     def connection_pattern(self, node):
-
         rval = [[True], [True], [False]]
         return rval
 
@@ -2534,17 +2549,14 @@ class AdvancedSubtensor(Op):
         x = as_tensor_variable(x)
         index = tuple(map(as_index_variable, index))
 
-        # We only want the broadcast information, and we don't need recursive
-        # `Subtensor` calls, so we create a fake symbolic shape tuple and
-        # identify the broadcast dimensions from the shape result of this
-        # entire subtensor operation.
+        # We create a fake symbolic shape tuple and identify the broadcast
+        # dimensions from the shape result of this entire subtensor operation.
         with config.change_flags(compute_test_value="off"):
             fake_shape = tuple(
-                tensor(dtype="int64", shape=()) if not bcast else 1
-                for bcast in x.broadcastable
+                tensor(dtype="int64", shape=()) if s != 1 else 1 for s in x.type.shape
             )
 
-            bcast_index = tuple(
+            fake_index = tuple(
                 chain.from_iterable(
                     aesara.tensor.basic.nonzero(idx)
                     if getattr(idx, "ndim", 0) > 0
@@ -2554,15 +2566,15 @@ class AdvancedSubtensor(Op):
                 )
             )
 
-            bcast = [
-                getattr(i, "value", i) == 1
-                for i in indexed_result_shape(fake_shape, bcast_index)
-            ]
+            out_shape = tuple(
+                i.value if isinstance(i, Constant) else None
+                for i in indexed_result_shape(fake_shape, fake_index)
+            )
 
         return Apply(
             self,
             (x,) + index,
-            [tensor(dtype=x.type.dtype, shape=bcast)],
+            [tensor(dtype=x.type.dtype, shape=out_shape)],
         )
 
     def R_op(self, inputs, eval_points):
@@ -2665,11 +2677,15 @@ class AdvancedIncSubtensor(Op):
         return Apply(
             self,
             (x, y) + tuple(new_inputs),
-            [tensor(dtype=x.type.dtype, shape=x.type.broadcastable)],
+            [
+                tensor(
+                    dtype=x.type.dtype,
+                    shape=tuple(1 if s == 1 else None for s in x.type.shape),
+                )
+            ],
         )
 
     def perform(self, node, inputs, out_):
-
         x, y, *indices = inputs
 
         check_advanced_indexing_dimensions(x, indices)
@@ -2691,7 +2707,6 @@ class AdvancedIncSubtensor(Op):
         return [ishapes[0]]
 
     def connection_pattern(self, node):
-
         rval = [[True], [True]]
 
         for ipt in node.inputs[2:]:

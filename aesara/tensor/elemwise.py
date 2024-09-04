@@ -1,5 +1,5 @@
 from copy import copy
-from typing import Tuple, Union
+from typing import List, Tuple
 
 import numpy as np
 
@@ -16,7 +16,6 @@ from aesara.misc.frozendict import frozendict
 from aesara.misc.safe_asarray import _asarray
 from aesara.printing import FunctionPrinter, Printer, pprint
 from aesara.scalar import get_scalar_type
-from aesara.scalar.basic import ScalarType
 from aesara.scalar.basic import bool as scalar_bool
 from aesara.scalar.basic import identity as scalar_identity
 from aesara.scalar.basic import transfer_type, upcast
@@ -30,6 +29,7 @@ from aesara.tensor.type import (
     float_dtypes,
     lvector,
 )
+from aesara.tensor.var import TensorVariable
 from aesara.utils import uniq
 
 
@@ -62,17 +62,17 @@ class DimShuffle(ExternalCOp):
     If `j = new_order[i]` is an index, the output's ith dimension
     will be the input's jth dimension.
     If `new_order[i]` is `x`, the output's ith dimension will
-    be 1 and Broadcast operations will be allowed to do broadcasting
+    be 1 and broadcast operations will be allowed to do broadcasting
     over that dimension.
 
-    If `input.broadcastable[i] == False` then `i` must be found in new_order.
+    If `input.type.shape[i] != 1` then `i` must be found in `new_order`.
     Broadcastable dimensions, on the other hand, can be discarded.
 
     .. code-block:: python
 
         DimShuffle((False, False, False), ['x', 2, 'x', 0, 1])
 
-    This op will only work on 3d tensors with no broadcastable
+    This `Op` will only work on 3d tensors with no broadcastable
     dimensions.  The first dimension will be broadcastable,
     then we will have the third dimension of the input tensor as
     the second of the resulting tensor, etc. If the tensor has
@@ -83,7 +83,7 @@ class DimShuffle(ExternalCOp):
 
         DimShuffle((True, False), [1])
 
-    This op will only work on 2d tensors with the first dimension
+    This `Op` will only work on 2d tensors with the first dimension
     broadcastable.
     The second dimension of the input tensor will be the first dimension of
     the resulting tensor.
@@ -186,7 +186,7 @@ class DimShuffle(ExternalCOp):
 
     def make_node(self, _input):
         input = as_tensor_variable(_input)
-        ib = tuple(input.type.broadcastable)
+        ib = tuple(s == 1 for s in input.type.shape)
         if ib != self.input_broadcastable:
             if len(ib) != len(self.input_broadcastable):
                 raise TypeError(
@@ -254,11 +254,10 @@ class DimShuffle(ExternalCOp):
         return self(*eval_points, return_list=True)
 
     def grad(self, inp, grads):
-
         (x,) = inp
         (gz,) = grads
         gz = as_tensor_variable(gz)
-        grad_order = ["x"] * len(x.type.broadcastable)
+        grad_order = ["x"] * x.type.ndim
         for i, v in enumerate(self.new_order):
             if v != "x":
                 grad_order[v] = i
@@ -269,7 +268,7 @@ class DimShuffle(ExternalCOp):
             return [inp[0].zeros_like(dtype=config.floatX)]
         else:
             return [
-                DimShuffle(gz.type.broadcastable, grad_order)(
+                DimShuffle(tuple(s == 1 for s in gz.type.shape), grad_order)(
                     Elemwise(scalar_identity)(gz)
                 )
             ]
@@ -325,9 +324,9 @@ class Elemwise(OpenMPOp):
     -``Elemwise(add, {0 : 1})``: represents ``+=`` on the second argument ``y += x``
     -``Elemwise(mul)(np.random.random((10, 5)), np.random.random((1, 5)))``:
     the second input is completed along the first dimension to match the first input
-    -``Elemwise(true_div)(np.random.random(10, 5), np.random.random(10, 1))``: same but along the
+    -``Elemwise(true_divide)(np.random.random(10, 5), np.random.random(10, 1))``: same but along the
     second dimension
-    -``Elemwise(int_div)(np.random.random((1, 5)), np.random.random((10, 1)))``:
+    -``Elemwise(floor_div)(np.random.random((1, 5)), np.random.random((10, 1)))``:
     the output has size ``(10, 5)``.
     -``Elemwise(log)(np.random.random((3, 4, 5)))``
 
@@ -406,7 +405,7 @@ class Elemwise(OpenMPOp):
                 # TODO: use LComplete instead
                 args.append(
                     dim_shuffle(
-                        input.type.broadcastable,
+                        tuple(1 if s == 1 else None for s in input.type.shape),
                         ["x"] * difference + list(range(length)),
                     )(input)
                 )
@@ -418,24 +417,45 @@ class Elemwise(OpenMPOp):
         # of all inputs in parallel... the all() gives us each output
         # broadcastable bit in turn.
 
+        def get_most_specialized_shape(shapes):
+            shapes = set(shapes)
+            # All shapes are the same
+            if len(shapes) == 1:
+                return tuple(shapes)[0]
+
+            # Only valid indeterminate case
+            if shapes == {None, 1}:
+                return None
+
+            shapes.discard(1)
+            shapes.discard(None)
+            if len(shapes) > 1:
+                raise ValueError
+            return tuple(shapes)[0]
+
         # it is multiplied by nout because Elemwise supports multiple outputs
         # (nout of them)
-        out_broadcastables = [
-            [
-                all(bcast)
-                for bcast in zip(*[input.type.broadcastable for input in inputs])
-            ]
-        ] * shadow.nout
+        try:
+            out_shapes = [
+                [
+                    get_most_specialized_shape(shape)
+                    for shape in zip(*[inp.type.shape for inp in inputs])
+                ]
+            ] * shadow.nout
+        except ValueError:
+            raise ValueError(
+                f"Incompatible Elemwise input shapes {[inp.type.shape for inp in inputs]}"
+            )
 
         # inplace_pattern maps output idx -> input idx
         inplace_pattern = self.inplace_pattern
         if inplace_pattern:
             for overwriter, overwritten in inplace_pattern.items():
-                for ob, ib in zip(
-                    out_broadcastables[overwriter],
-                    inputs[overwritten].type.broadcastable,
+                for out_s, in_s in zip(
+                    out_shapes[overwriter],
+                    inputs[overwritten].type.shape,
                 ):
-                    if ib and not ob:
+                    if in_s == 1 and out_s != 1:
                         raise ValueError(
                             "Operation cannot be done inplace on an input "
                             "with broadcasted dimensions."
@@ -451,8 +471,8 @@ class Elemwise(OpenMPOp):
                     ([i.type.dtype for i in inputs], out_dtypes, inplace_pattern),
                 )
             )
-        assert len(out_dtypes) == len(out_broadcastables)
-        return out_dtypes, out_broadcastables, inputs
+        assert len(out_dtypes) == len(out_shapes)
+        return out_dtypes, out_shapes, inputs
 
     def make_node(self, *inputs):
         """
@@ -461,12 +481,10 @@ class Elemwise(OpenMPOp):
         using DimShuffle.
         """
         inputs = [as_tensor_variable(i) for i in inputs]
-        out_dtypes, out_broadcastables, inputs = self.get_output_info(
-            DimShuffle, *inputs
-        )
+        out_dtypes, out_shapes, inputs = self.get_output_info(DimShuffle, *inputs)
         outputs = [
-            TensorType(dtype=dtype, shape=broadcastable)()
-            for dtype, broadcastable in zip(out_dtypes, out_broadcastables)
+            TensorType(dtype=dtype, shape=shape)()
+            for dtype, shape in zip(out_dtypes, out_shapes)
         ]
         return Apply(self, inputs, outputs)
 
@@ -516,7 +534,6 @@ class Elemwise(OpenMPOp):
         return rval
 
     def connection_pattern(self, node):
-
         if hasattr(self.scalar_op, "connection_pattern"):
             return self.scalar_op.connection_pattern(node)
 
@@ -559,8 +576,8 @@ class Elemwise(OpenMPOp):
             # TODO: only count dimensions that were effectively broadcasted
             to_sum = [
                 j
-                for j, bcast in enumerate(ipt.type.broadcastable)
-                if bcast and not outs[0].broadcastable[j]
+                for j, in_s in enumerate(ipt.type.shape)
+                if in_s == 1 and outs[0].type.shape[j] != 1
             ]
 
             if to_sum:
@@ -595,7 +612,7 @@ class Elemwise(OpenMPOp):
                 f"{str(self.scalar_op)}.grad returned {str(type(scalar_igrads))} instead of list or tuple"
             )
 
-        nd = len(inputs[0].type.broadcastable)  # this is the same for everyone
+        nd = inputs[0].type.ndim  # this is the same for everyone
 
         def transform(r):
             # From a graph of ScalarOps, make a graph of Broadcast ops.
@@ -662,7 +679,6 @@ class Elemwise(OpenMPOp):
             and self.ufunc is None
             and impl == "py"
         ):
-
             ufunc = np.frompyfunc(
                 self.scalar_op.impl, len(node.inputs), self.scalar_op.nout
             )
@@ -803,38 +819,18 @@ class Elemwise(OpenMPOp):
             else:
                 storage[0] = variable
 
-    def infer_shape(self, fgraph, node, i_shapes):
-        rval = []
-        for o in node.outputs:
-            oshp = []
-            for dim, b in enumerate(o.type.broadcastable):
-                b_dim = None
-                if b:
-                    # this is broadcastable
-                    b_dim = 1
-                else:
-                    # there must be some input that is not broadcastable in
-                    # dimension 'dim'
-                    for ishp, i in zip(i_shapes, node.inputs):
-                        if isinstance(i.type, ScalarType):
-                            continue  # we skip scalar
-                        if not i.type.broadcastable[dim]:
-                            # input i is not broadcastable in position dim
-                            # therefore if its shape is known, we can use it
-                            # as the output shape
-                            if ishp[dim]:
-                                b_dim = ishp[dim]
-                                break
+    def infer_shape(self, fgraph, node, i_shapes) -> List[Tuple[TensorVariable, ...]]:
+        if len(node.outputs) > 1:
+            from aesara.tensor.exceptions import ShapeError
 
-                # b_dim might still be None, if every input's shape was unknown
-                # in dimension 'dim'
-                oshp.append(b_dim)
-                # TODO: it would be interesting to return the constraining
-                # information that if one of the inputs shape[dim] is known
-                # and another input's shape[dim] is not, that we can now assume
-                # that the other input's shape[dim] is the same as the first.
-            rval.append(tuple(oshp))
-        return rval
+            raise ShapeError(
+                "Multiple outputs are not supported by the default `Elemwise.infer_shape`"
+            )
+
+        out_shape = aesara.tensor.broadcast_shape(*i_shapes, arrays_are_shapes=True)
+
+        # The `as_tensor_variable` should convert `ScalarType`s to `TensorType`s
+        return [tuple(as_tensor_variable(s) for s in out_shape)]
 
     def _c_all(self, node, nodename, inames, onames, sub):
         # Some `Op`s directly call `Elemwise._c_all` or `Elemwise.c_code`
@@ -897,7 +893,7 @@ class Elemwise(OpenMPOp):
         # for each input:
         # same as range(ndim), but with 'x' at all broadcastable positions
         orders = [
-            [x and "x" or i for i, x in enumerate(input.type.broadcastable)]
+            [s == 1 and "x" or i for i, s in enumerate(input.type.shape)]
             for input in inputs
         ]
 
@@ -920,7 +916,7 @@ class Elemwise(OpenMPOp):
             [
                 f"PyArray_ISFORTRAN({arr})"
                 for arr, var in z
-                if not all(var.broadcastable)
+                if not all(s == 1 for s in var.type.shape)
             ]
         )
         # If it is a scalar, make it c contig to prevent problem with
@@ -1005,7 +1001,7 @@ class Elemwise(OpenMPOp):
             or
             # Use simpler code when output ndim == 0 or 1
             # or for broadcated scalar.
-            all(node.outputs[0].broadcastable)
+            all(s == 1 for s in node.outputs[0].type.shape)
         ):
             if nnested:
                 all_code = [("", "")] * (nnested - 1) + [("", code)] + [""]
@@ -1015,7 +1011,7 @@ class Elemwise(OpenMPOp):
                 # No loops
                 task_decl = "".join(
                     [
-                        "{}& {}_i = *{}_iter;\n".format(dtype, name, name)
+                        f"{dtype}& {name}_i = *{name}_iter;\n"
                         for name, dtype in zip(
                             inames + list(real_onames), idtypes + list(real_odtypes)
                         )
@@ -1077,7 +1073,7 @@ class Elemwise(OpenMPOp):
             all(o.ndim >= 1 for o in node.outputs)
             and
             # Don't use the contig code for broadcasted scalar.
-            not all(node.outputs[0].broadcastable)
+            not all(s == 1 for s in node.outputs[0].type.shape)
         ):
             contig = None
             try:
@@ -1110,7 +1106,7 @@ class Elemwise(OpenMPOp):
                     """
                     index = ""
                     for x, var in zip(inames + onames, inputs + node.outputs):
-                        if not all(var.broadcastable):
+                        if not all(s == 1 for s in var.type.shape):
                             contig += (
                                 """
             dtype_%(x)s * %(x)s_ptr = (dtype_%(x)s*) PyArray_DATA(%(x)s);
@@ -1144,18 +1140,19 @@ class Elemwise(OpenMPOp):
                     )
             if contig is not None:
                 z = list(zip(inames + onames, inputs + node.outputs))
+                all_broadcastable = all(s == 1 for s in var.type.shape)
                 cond1 = " && ".join(
                     [
                         "PyArray_ISCONTIGUOUS(%s)" % arr
                         for arr, var in z
-                        if not all(var.broadcastable)
+                        if not all_broadcastable
                     ]
                 )
                 cond2 = " && ".join(
                     [
                         "PyArray_ISFORTRAN(%s)" % arr
                         for arr, var in z
-                        if not all(var.broadcastable)
+                        if not all_broadcastable
                     ]
                 )
                 loop = (
@@ -1256,33 +1253,61 @@ class CAReduce(COp):
 
     """
 
-    __props__: Union[
-        Tuple[str], Tuple[str, str], Tuple[str, str, str], Tuple[str, str, str, str]
-    ] = ("scalar_op", "axis")
+    __props__ = ("scalar_op", "axis", "dtype", "acc_dtype", "upcast_discrete_output")
 
-    def __init__(self, scalar_op, axis=None):
+    def __init__(
+        self,
+        scalar_op,
+        axis=None,
+        dtype=None,
+        acc_dtype=None,
+        upcast_discrete_output=False,
+    ):
         """
 
         Parameters
         ----------
         scalar_op
-            A binary scalar `Op` with only one output. It must be commutative
-            and associative.
+            A binary scalar `Op` with only one output.
+            It must be commutative and associative.
         axis
-            - The dimension along which we want to reduce
-            - List of dimensions that we want to reduce
-            - If ``None``, all dimensions are reduced
+            - the dimension along which we want to reduce
+            - list of dimensions that we want to reduce
+            - if ``None``, all dimensions are reduced
+        dtype
+            The dtype of the returned tensor. If ``None``, then we use the default
+            dtype which is the same as the input array's dtype except when
+            `upcast_discrete_output` is ``True`` and the following holds:
+
+            - the input dtype is a signed integer of precision < 64 bit, in which
+            case we use int64
+            - the input dtype is an unsigned integer of precision < 64 bit, in
+            which case we use uint64
+
+            This default dtype does _not_ depend on the value of `acc_dtype`.
+            This behavior is similar in spirit to that of NumPy, except that
+            NumPy uses the default machine integer while we always use 64 bit
+            integers to avoid platform-dependent behavior.
+        acc_dtype
+            The dtype of the internal accumulator.
+            If ``None`` (default), we use the dtype in the list below,
+            or the input dtype if its precision is higher:
+
+            - for int dtypes, we use at least int64;
+            - for uint dtypes, we use at least uint64;
+            - for float dtypes, we use at least float64;
+            - for complex dtypes, we use at least complex128.
+        upcast_discrete_output
+            See
 
         """
         if scalar_op.nin not in (-1, 2) or scalar_op.nout != 1:
             raise NotImplementedError(
-                "CAReduce only supports binary functions with a single " "output."
+                "CAReduce only supports binary functions with a single output."
             )
 
         self.axis = None
-        self.ufunc_is_vectorized = False
         self.scalar_op = scalar_op
-        self.set_ufunc(scalar_op)
 
         if axis is not None:
             if isinstance(axis, (int, np.integer)) or (
@@ -1292,63 +1317,178 @@ class CAReduce(COp):
             else:
                 self.axis = tuple(axis)
 
-    def set_ufunc(self, scalar_op):
-        if hasattr(scalar_op, "nfunc_spec") and hasattr(np, scalar_op.nfunc_spec[0]):
-            self.ufunc = getattr(np, scalar_op.nfunc_spec[0])
-        else:
-            self.ufunc = np.frompyfunc(scalar_op.impl, 2, 1)
-            self.ufunc_is_vectorized = True
+        self.dtype = dtype
+        self.acc_dtype = acc_dtype
+        self.upcast_discrete_output = upcast_discrete_output
 
-    def _output_dtype(self, input_dtype):
-        return input_dtype
+    @property
+    def ufunc(self):
+        if hasattr(self, "_ufunc"):
+            return self._ufunc
+
+        if hasattr(self.scalar_op, "nfunc_spec") and hasattr(
+            np, self.scalar_op.nfunc_spec[0]
+        ):
+            self._ufunc = getattr(np, self.scalar_op.nfunc_spec[0])
+        else:
+            self._ufunc = np.frompyfunc(
+                self.scalar_op.impl, 2, 1, identity=self.scalar_op.identity
+            )
+
+        return self._ufunc
+
+    def _output_dtype(self, idtype):
+        if not self.upcast_discrete_output:
+            return idtype
+
+        dtype = self.dtype
+
+        if dtype == "OLD":
+            return dict(
+                int8="int32",
+                int16="int32",
+                int32="int64",
+                uint8="uint32",
+                uint16="uint32",
+                uint32="uint64",
+            ).get(idtype, idtype)
+        elif dtype is None:
+            # If input has a discrete dtype, upcast it to 64
+            return dict(
+                bool="int64",
+                int8="int64",
+                int16="int64",
+                int32="int64",
+                uint8="uint64",
+                uint16="uint64",
+                uint32="uint64",
+            ).get(idtype, idtype)
+        else:
+            # The important is that the accumulator dtype does not
+            # lose precision. Then, the result can be downcasted.
+            return dtype
+
+    def _acc_dtype(self, idtype):
+        acc_dtype = self.acc_dtype
+        if acc_dtype is None:
+            return dict(
+                bool="int64",
+                int8="int64",
+                int16="int64",
+                int32="int64",
+                uint8="uint64",
+                uint16="uint64",
+                uint32="uint64",
+                float16="float32",
+                float32="float64",
+                complex64="complex128",
+            ).get(idtype, idtype)
+        elif acc_dtype in continuous_dtypes and idtype in discrete_dtypes:
+            # Specifying a continuous accumulator for discrete input is OK
+            return acc_dtype
+        else:
+            # The conversion has to be considered an upcast.
+            upcasted_dtype = upcast(idtype, acc_dtype)
+            if acc_dtype != upcasted_dtype:
+                raise TypeError(
+                    f"Cannot build {self} node with input dtype {idtype} "
+                    f"and acc_dtype {acc_dtype}, as precision would be lost. "
+                    "To correct this error, you can:\n"
+                    "  - not specify acc_dtype, or\n"
+                    f"  - use an acc_dtype at least as precise as {upcasted_dtype}.\n"
+                    '  - specify "dtype" instead of "acc_dtype", so '
+                    "the reduction will be precise, but the result will "
+                    'be casted into "dtype" at the end.\n'
+                    "If you are expecting the precision loss, you can "
+                    f'use tensor.cast(..., dtype="{acc_dtype}"), on your input.'
+                )
+            return acc_dtype
 
     def make_node(self, input):
         input = as_tensor_variable(input)
         inp_dims = input.type.ndim
-        inp_bdcast = input.type.broadcastable
         inp_dtype = input.type.dtype
 
+        # We need to redefine make_node so that, if self.dtype is None,
+        # we can infer what dtype should be, and create a node from an Op
+        # of the appropriate dtype.
+        dtype = self._output_dtype(inp_dtype)
+        acc_dtype = self._acc_dtype(inp_dtype)
+
+        assert dtype is not None
+        assert acc_dtype is not None
+
         axis = self.axis
-        if axis is None:
-            axis = list(range(inp_dims))
 
-        copy_op = any(a < 0 for a in axis)
         # scalar inputs are treated as 1D regarding axis in this `Op`
-        try:
-            axis = np.core.numeric.normalize_axis_tuple(axis, ndim=max(1, inp_dims))
-        except np.AxisError:
-            raise np.AxisError(axis, ndim=inp_dims)
+        if axis is not None:
+            try:
+                axis = np.core.numeric.normalize_axis_tuple(axis, ndim=max(1, inp_dims))
+            except np.AxisError:
+                raise np.AxisError(axis, ndim=inp_dims)
 
-        # We can't call self.__class__() as there is a class that
-        # inherits from CAReduce that doesn't have the same signature
-        if copy_op:
-            op = copy(self)
-            op.set_ufunc(op.scalar_op)
-            assert len(axis) == len(self.axis)
-            op.axis = tuple(axis)
+            out_shape = tuple(
+                s for i, s in enumerate(input.type.shape) if i not in axis
+            )
+        else:
+            out_shape = ()
+
+        if (
+            (axis is not None and any(a < 0 for a in axis))
+            or dtype != self.dtype
+            or acc_dtype != self.acc_dtype
+        ):
+            op = self.clone(axis=axis, dtype=dtype, acc_dtype=acc_dtype)
         else:
             op = self
 
-        broadcastable = [x for i, x in enumerate(inp_bdcast) if i not in axis]
-
-        output = TensorType(dtype=self._output_dtype(inp_dtype), shape=broadcastable)()
+        output = TensorType(dtype=dtype, shape=out_shape)()
 
         return Apply(op, [input], [output])
 
-    def __getstate__(self):
-        d = copy(self.__dict__)
-        d.pop("ufunc", None)
-        return d
+    def clone(
+        self,
+        axis=None,
+        dtype=None,
+        acc_dtype=None,
+        upcast_discrete_output=None,
+        **kwargs,
+    ):
+        if axis is None:
+            axis = self.axis
+        if dtype is None:
+            dtype = self.dtype
+        if acc_dtype is None:
+            acc_dtype = self.acc_dtype
+        if upcast_discrete_output is None:
+            upcast_discrete_output = self.upcast_discrete_output
 
-    def __setstate__(self, d):
-        self.__dict__.update(d)
-        self.set_ufunc(self.scalar_op)
+        res = type(self)(
+            self.scalar_op,
+            axis=axis,
+            dtype=dtype,
+            acc_dtype=acc_dtype,
+            upcast_discrete_output=None,
+            **kwargs,
+        )
+
+        return res
 
     def __str__(self):
         prefix = f"{type(self).__name__}{{{self.scalar_op}}}"
+        extra_params = []
+
         if self.axis is not None:
-            axes_str = ", ".join(str(x) for x in self.axis)
-            return f"{prefix}{{{axes_str}}}"
+            axis = ", ".join(str(x) for x in self.axis)
+            extra_params.append(f"axis=[{axis}]")
+
+        if self.acc_dtype:
+            extra_params.append(f"acc_dtype={self.acc_dtype}")
+
+        extra_params_str = ", ".join(extra_params)
+
+        if extra_params_str:
+            return f"{prefix}{{{extra_params_str}}}"
         else:
             return f"{prefix}"
 
@@ -1356,47 +1496,30 @@ class CAReduce(COp):
         (input,) = inp
         (output,) = out
         axis = self.axis
-        if axis is None:
-            axis = list(range(input.ndim))
 
-        if hasattr(self, "acc_dtype") and self.acc_dtype is not None:
+        out_dtype = node.outputs[0].type.dtype
+
+        if self.acc_dtype is not None:
             acc_dtype = self.acc_dtype
         else:
-            acc_dtype = node.outputs[0].type.dtype
+            acc_dtype = out_dtype
 
-        variable = np.array(input, dtype=acc_dtype)
+        # out_dtype = self.dtype if self.dtype and self.dtype != "OLD" else out_dtype
 
-        if axis:
-            # Reducing functions built using np.frompyfunc() do not
-            # support reduction along multiple axes. Hence loop through
-            # each, otherwise numpy's inbuilt reduction functions
-            # support reduction along multiple axes directly.
-            if self.ufunc_is_vectorized:
-                to_reduce = reversed(sorted(axis))
-                for dimension in to_reduce:
-                    variable = self.ufunc.reduce(variable, dimension, dtype=acc_dtype)
-            else:
-                variable = self.ufunc.reduce(variable, axis=tuple(axis))
-            output[0] = _asarray(variable, dtype=node.outputs[0].type.dtype)
-        else:
-            # Force a copy
-            output[0] = np.array(variable, copy=True, dtype=node.outputs[0].type.dtype)
+        input = np.array(input, dtype=acc_dtype)
+
+        out = self.ufunc.reduce(input, axis=axis, dtype=acc_dtype)
+
+        output[0] = _asarray(out, dtype=out_dtype)
 
     def infer_shape(self, fgraph, node, shapes):
         (ishape,) = shapes
         axis = self.axis
         if axis is None:
             return ((),)
-        return (
-            [
-                ishape[i]
-                for (i, b) in enumerate(node.inputs[0].type.broadcastable)
-                if i not in axis
-            ],
-        )
+        return ([ishape[i] for i in range(node.inputs[0].type.ndim) if i not in axis],)
 
     def _c_all(self, node, name, inames, onames, sub):
-
         input = node.inputs[0]
         output = node.outputs[0]
 
@@ -1411,14 +1534,14 @@ class CAReduce(COp):
         if acc_dtype is not None:
             if acc_dtype == "float16":
                 raise MethodNotDefined("no c_code for float16")
-            acc_type = TensorType(shape=node.outputs[0].broadcastable, dtype=acc_dtype)
+            acc_type = TensorType(shape=node.outputs[0].type.shape, dtype=acc_dtype)
             adtype = acc_type.dtype_specs()[1]
         else:
             adtype = odtype
 
         axis = self.axis
         if axis is None:
-            axis = list(range(len(input.type.broadcastable)))
+            axis = list(range(input.type.ndim))
 
         if len(axis) == 0:
             # The acc_dtype is never a downcast compared to the input dtype
@@ -1590,176 +1713,6 @@ class CAReduce(COp):
             return tuple(version)
         else:
             return ()
-
-
-class CAReduceDtype(CAReduce):
-    """A subclass of `CAReduce` that accepts an additional output "dtype" parameter.
-
-    It also accepts an optional `acc_dtype`, which specifies the dtype that
-    will be used for the accumulation.  The accumulation will be done using an
-    array of dtype `acc_dtype`, then it will be cast into `dtype` and returned.
-
-    If no `dtype` is provided, one will be inferred so as not to lose
-    too much precision.
-
-    """
-
-    __props__: Union[Tuple[str, str, str], Tuple[str, str, str, str]] = (
-        "scalar_op",
-        "axis",
-        "dtype",
-        "acc_dtype",
-    )
-
-    def __init__(self, scalar_op, axis=None, dtype=None, acc_dtype=None):
-        """
-
-        Parameters
-        ----------
-        scalar_op
-            A binary scalar `Op` with only one output.
-            It must be commutative and associative.
-        axis
-            * the dimension along which we want to reduce
-            * list of dimensions that we want to reduce
-            * if ``None``, all dimensions are reduced
-        dtype
-            The dtype of the returned tensor. If ``None``, then we use the default
-            dtype which is the same as the input array's dtype except when:
-
-            * the input dtype is a signed integer of precision < 64 bit, in which
-            case we use int64
-            * the input dtype is an unsigned integer of precision < 64 bit, in
-            which case we use uint64
-
-            This default dtype does _not_ depend on the value of `acc_dtype`.
-            This behavior is similar in spirit to that of NumPy, except that
-            NumPy uses the default machine integer while we always use 64 bit
-            integers to avoid platform-dependent behavior.
-        acc_dtype
-            The dtype of the internal accumulator.
-            If ``None`` (default), we use the dtype in the list below,
-            or the input dtype if its precision is higher:
-
-            * for int dtypes, we use at least int64;
-            * for uint dtypes, we use at least uint64;
-            * for float dtypes, we use at least float64;
-            * for complex dtypes, we use at least complex128.
-
-        """
-        super().__init__(scalar_op, axis=axis)
-        self.dtype = dtype
-        self.acc_dtype = acc_dtype
-
-    def __setstate__(self, d):
-        super().__setstate__(d)
-        if not hasattr(self, "dtype"):
-            # This is needed as old pickled will crash otherwise.
-            # We need to keep the old dtype behavior as the op
-            # could be in an apply node with a specified dtype.
-            self.dtype = "OLD"
-
-        if not hasattr(self, "acc_dtype"):
-            # acc_dtype is not used by any external Op, so we do not
-            # need to keep the previous behaviour here.
-            self.acc_dtype = None
-
-    def _output_dtype(self, idtype):
-        dtype = self.dtype
-        if dtype == "OLD":
-            return dict(
-                int8="int32",
-                int16="int32",
-                int32="int64",
-                uint8="uint32",
-                uint16="uint32",
-                uint32="uint64",
-            ).get(idtype, idtype)
-        if dtype is None:
-            # If input has a discrete dtype, upcast it to 64
-            return dict(
-                bool="int64",
-                int8="int64",
-                int16="int64",
-                int32="int64",
-                uint8="uint64",
-                uint16="uint64",
-                uint32="uint64",
-            ).get(idtype, idtype)
-        else:
-            # The important is that the accumulator dtype does not
-            # lose precision. Then, the result can be downcasted.
-            return dtype
-
-    def _acc_dtype(self, idtype):
-        acc_dtype = self.acc_dtype
-        if acc_dtype is None:
-            return dict(
-                bool="int64",
-                int8="int64",
-                int16="int64",
-                int32="int64",
-                uint8="uint64",
-                uint16="uint64",
-                uint32="uint64",
-                float16="float32",
-                float32="float64",
-                complex64="complex128",
-            ).get(idtype, idtype)
-        elif acc_dtype in continuous_dtypes and idtype in discrete_dtypes:
-            # Specifying a continuous accumulator for discrete input is OK
-            return acc_dtype
-        else:
-            # The conversion has to be considered an upcast.
-            upcasted_dtype = upcast(idtype, acc_dtype)
-            if acc_dtype != upcasted_dtype:
-                raise TypeError(
-                    f"Cannot build {self} node with input dtype {idtype} "
-                    f"and acc_dtype {acc_dtype}, as precision would be lost. "
-                    "To correct this error, you can:\n"
-                    "  - not specify acc_dtype, or\n"
-                    f"  - use an acc_dtype at least as precise as {upcasted_dtype}.\n"
-                    '  - specify "dtype" instead of "acc_dtype", so '
-                    "the reduction will be precise, but the result will "
-                    'be casted into "dtype" at the end.\n'
-                    "If you are expecting the precision loss, you can "
-                    f'use tensor.cast(..., dtype="{acc_dtype}"), on your input.'
-                )
-            return acc_dtype
-
-    def make_node(self, input):
-        # We need to redefine make_node so that, if self.dtype is None,
-        # we can infer what dtype should be, and create a node from an Op
-        # of the appropriate dtype.
-        input = as_tensor_variable(input)
-        dtype = self._output_dtype(input.dtype)
-        acc_dtype = self._acc_dtype(input.dtype)
-
-        assert dtype is not None
-        assert acc_dtype is not None
-
-        if dtype == self.dtype and acc_dtype == self.acc_dtype:
-            # Don't build another instance
-            op = self
-        else:
-            op = copy(self)
-            op.set_ufunc(self.scalar_op)
-            op.dtype = dtype
-            op.acc_dtype = acc_dtype
-
-        assert op.acc_dtype is not None
-
-        # TODO: Why doesn't `make_node` just take these
-        # automatically-determined values as arguments?
-        return super(CAReduceDtype, op).make_node(input)
-
-    def __str__(self):
-        prefix = f"{type(self).__name__}{{{self.scalar_op}}}"
-        if self.axis is not None:
-            axis = ", ".join(str(x) for x in self.axis)
-            return f"{prefix}{{axis=[{axis}], acc_dtype={self.acc_dtype}}}"
-        else:
-            return f"{prefix}{{acc_dtype={self.acc_dtype}}}"
 
 
 def scalar_elemwise(*symbol, nfunc=None, nin=None, nout=None, symbolname=None):

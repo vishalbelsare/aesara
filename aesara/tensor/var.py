@@ -3,19 +3,23 @@ import traceback as tb
 import warnings
 from collections.abc import Iterable
 from numbers import Number
-from typing import Optional
+from typing import Optional, TypeVar
 
 import numpy as np
 
 from aesara import tensor as at
 from aesara.configdefaults import config
-from aesara.graph.basic import Constant, Variable
+from aesara.graph.basic import Constant, OptionalApplyType, Variable
 from aesara.graph.utils import MetaType
 from aesara.scalar import ComplexError, IntegerDivisionError
 from aesara.tensor import _get_vector_length, as_tensor_variable
 from aesara.tensor.exceptions import AdvancedIndexingError
 from aesara.tensor.type import TensorType
+from aesara.tensor.type_other import NoneConst
 from aesara.tensor.utils import hash_from_ndarray
+
+
+_TensorTypeType = TypeVar("_TensorTypeType", bound=TensorType)
 
 
 class _tensor_py_operators:
@@ -166,16 +170,16 @@ class _tensor_py_operators:
         return at.math.divmod(self, other)
 
     def __truediv__(self, other):
-        return at.math.true_div(self, other)
+        return at.math.true_divide(self, other)
 
     def __floordiv__(self, other):
-        return at.math.floor_div(self, other)
+        return at.math.floor_divide(self, other)
 
     def __rtruediv__(self, other):
-        return at.math.true_div(other, self)
+        return at.math.true_divide(other, self)
 
     def __rfloordiv__(self, other):
-        return at.math.floor_div(other, self)
+        return at.math.floor_divide(other, self)
 
     # Do not use these; in-place `Op`s should be inserted by optimizations
     # only!
@@ -285,6 +289,12 @@ class _tensor_py_operators:
     def reshape(self, shape, ndim=None):
         """Return a reshaped view/copy of this variable.
 
+        Returns a view of this ``Variable`` that has been reshaped as in
+        `numpy.reshape`.  If the shape is a `Variable` argument, then you might
+        need to use the optional `ndim` parameter to declare how many elements
+        the shape has, and therefore how many dimensions the reshaped ``Variable``
+        will have.
+
         Parameters
         ----------
         shape
@@ -312,6 +322,22 @@ class _tensor_py_operators:
         """
         Reorder the dimensions of this variable, optionally inserting
         broadcasted dimensions.
+
+        Returns a view of this variable with permuted dimensions.  Typically the
+        pattern will include the integers ``0, 1, ... ndim-1``, and any number of
+        ``'x'`` characters in dimensions where this variable should be broadcasted.
+
+        A few examples of patterns and their effect:
+
+            * ``('x',)``: make a 0d (scalar) into a 1d vector
+            * ``(0, 1)``: identity for 2d vectors
+            * ``(1, 0)``: inverts the first and second dimensions
+            * ``('x', 0)``: make a row out of a 1d vector (N to 1xN)
+            * ``(0, 'x')``: make a column out of a 1d vector (N to Nx1)
+            * ``(2, 0, 1)``: AxBxC to CxAxB
+            * ``(0, 'x', 1)``: AxB to Ax1xB
+            * ``(1, 'x', 0)``: AxB to Bx1xA
+            * ``(1,)``: This removes the dimension at index 0. It must be a broadcastable dimension.
 
         Parameters
         ----------
@@ -343,9 +369,16 @@ class _tensor_py_operators:
         return op(self)
 
     def flatten(self, ndim=1):
+        """
+        Returns a view of this variable with `ndim` dimensions, whose shape for the first
+        ``ndim-1`` dimensions will be the same as ``self``, and shape in the
+        remaining dimension will be expanded to fit in all the data from ``self``.
+
+        """
         return at.basic.flatten(self, ndim)
 
     def ravel(self):
+        """See `flatten`."""
         return at.basic.flatten(self)
 
     def diagonal(self, offset=0, axis1=0, axis2=1):
@@ -463,7 +496,7 @@ class _tensor_py_operators:
         ellipses = []
         index_dim_count = 0
         for i, arg in enumerate(args):
-            if arg is np.newaxis:
+            if arg is np.newaxis or arg is NoneConst:
                 # no increase in index_dim_count
                 pass
             elif arg is Ellipsis:
@@ -512,13 +545,13 @@ class _tensor_py_operators:
                 isinstance(val, np.ndarray) and val.size == 0
             )
 
-        # Force input to be int64 datatype if input is an empty list or tuple
+        # Force input to be an int datatype if input is an empty list or tuple
         # Else leave it as is if it is a real number
         # Convert python literals to aesara constants
         args = tuple(
             [
                 at.subtensor.as_index_constant(
-                    np.array(inp, dtype=np.int64) if is_empty_array(inp) else inp
+                    np.array(inp, dtype=np.uint8) if is_empty_array(inp) else inp
                 )
                 for inp in args
             ]
@@ -534,7 +567,7 @@ class _tensor_py_operators:
                 advanced = True
                 break
 
-            if arg is not np.newaxis:
+            if arg is not np.newaxis and arg is not NoneConst:
                 try:
                     at.subtensor.index_vars_to_types(arg)
                 except AdvancedIndexingError:
@@ -546,7 +579,7 @@ class _tensor_py_operators:
         if advanced:
             return at.subtensor.advanced_subtensor(self, *args)
         else:
-            if np.newaxis in args:
+            if np.newaxis in args or NoneConst in args:
                 # `np.newaxis` (i.e. `None`) in NumPy indexing mean "add a new
                 # broadcastable dimension at this location".  Since Aesara adds
                 # new broadcastable dimensions via the `DimShuffle` `Op`, the
@@ -558,7 +591,7 @@ class _tensor_py_operators:
                 pattern = []
                 new_args = []
                 for arg in args:
-                    if arg == np.newaxis:
+                    if arg is np.newaxis or arg is NoneConst:
                         pattern.append("x")
                         new_args.append(slice(None, None, None))
                     else:
@@ -576,9 +609,9 @@ class _tensor_py_operators:
                     # with some symbolic variable.
                     if not (
                         isinstance(arg, slice)
-                        and arg.start is None
-                        and arg.stop is None
-                        and arg.step is None
+                        and (arg.start is None or arg.start is NoneConst)
+                        and (arg.stop is None or arg.stop is NoneConst)
+                        and (arg.step is None or arg.step is NoneConst)
                     ):
                         full_slices = False
                 if full_slices:
@@ -810,15 +843,31 @@ class _tensor_py_operators:
         """Return selected slices only."""
         return at.extra_ops.compress(self, a, axis=axis)
 
+    @property
+    def real(self):
+        return at.math.real(self)
 
-class TensorVariable(_tensor_py_operators, Variable):
+    @property
+    def imag(self):
+        return at.math.imag(self)
+
+
+class TensorVariable(
+    _tensor_py_operators, Variable[_TensorTypeType, OptionalApplyType]
+):
     """
     Subclass to add the tensor operators to the basic `Variable` class.
 
     """
 
-    def __init__(self, type, owner=None, index=None, name=None):
-        super().__init__(type, owner=owner, index=index, name=name)
+    def __init__(
+        self,
+        type: _TensorTypeType,
+        owner: OptionalApplyType,
+        index=None,
+        name=None,
+    ):
+        super().__init__(type, owner, index=index, name=name)
         if config.warn_float64 != "ignore" and type.dtype == "float64":
             msg = (
                 "You are creating a TensorVariable "
@@ -866,10 +915,18 @@ TensorType.variable_type = TensorVariable
 
 
 class TensorConstantSignature(tuple):
-    """
-    A Signature object for comparing TensorConstant instances.
+    r"""A signature object for comparing `TensorConstant` instances.
 
-    An instance is a pair: (Type instance, ndarray).
+    An instance is a pair with the type ``(Type, ndarray)``.
+
+    TODO FIXME: Subclassing `tuple` is unnecessary, and it appears to be
+    preventing the use of a much more convenient `__init__` that removes the
+    need for all these lazy computations and their safety checks.
+
+    Also, why do we even need this signature stuff?  We could simply implement
+    good `Constant.__eq__` and `Constant.__hash__` implementations.
+
+    We could also produce plain `tuple`\s with hashable values.
 
     """
 
@@ -918,19 +975,26 @@ class TensorConstantSignature(tuple):
         _, d = self
         return hash_from_ndarray(d)
 
-    def _get_sum(self):
+    @property
+    def sum(self):
         """Compute sum of non NaN / Inf values in the array."""
         try:
             return self._sum
         except AttributeError:
-            self._sum = self.no_nan.sum()
-            # The following 2 lines are needede as in Python 3.3 with NumPy
+            # Prevent warnings when there are `inf`s and `-inf`s present
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                self._sum = self.no_nan.sum()
+
+            # The following 2 lines are needed as in Python 3.3 with NumPy
             # 1.7.1, numpy.ndarray and numpy.memmap aren't hashable.
             if isinstance(self._sum, np.memmap):
                 self._sum = np.asarray(self._sum).item()
+
             if self.has_nan and self.no_nan.mask.all():
                 # In this case the sum is not properly computed by numpy.
                 self._sum = 0
+
             if np.isinf(self._sum) or np.isnan(self._sum):
                 # NaN may happen when there are both -inf and +inf values.
                 if self.has_nan:
@@ -945,24 +1009,21 @@ class TensorConstantSignature(tuple):
                     self._sum = np.ma.masked_array(self[1], mask).sum()
                 # At this point there should be no more NaN.
                 assert not np.isnan(self._sum)
+
+            if isinstance(self._sum, np.ma.core.MaskedConstant):
+                self._sum = 0
+
         return self._sum
 
-    sum = property(_get_sum)
-
-    def _get_no_nan(self):
+    @property
+    def no_nan(self):
         try:
             return self._no_nan
         except AttributeError:
-            nan_mask = np.isnan(self[1])
-            if nan_mask.any():
-                self._no_nan = np.ma.masked_array(self[1], nan_mask)
-                self.has_nan = True
-            else:
-                self._no_nan = self[1]
-                self.has_nan = False
+            nans = np.isnan(self[1])
+            self._no_nan = np.ma.masked_array(self[1], nans)
+            self.has_nan = np.any(nans)
         return self._no_nan
-
-    no_nan = property(_get_no_nan)
 
 
 def get_unique_value(x: TensorVariable) -> Optional[Number]:
@@ -979,10 +1040,10 @@ def get_unique_value(x: TensorVariable) -> Optional[Number]:
     return None
 
 
-class TensorConstant(TensorVariable, Constant):
+class TensorConstant(TensorVariable, Constant[_TensorTypeType]):
     """Subclass to add the tensor operators to the basic `Constant` class."""
 
-    def __init__(self, type, data, name=None):
+    def __init__(self, type: _TensorTypeType, data, name=None):
         data_shape = np.shape(data)
 
         if len(data_shape) != type.ndim or any(
@@ -1012,7 +1073,7 @@ class TensorConstant(TensorVariable, Constant):
             name = self.name
         else:
             name = "TensorConstant"
-        return "%s{%s}" % (name, val)
+        return f"{name}{{{val}}}"
 
     def signature(self):
         return TensorConstantSignature((self.type, self.data))

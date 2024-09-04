@@ -6,11 +6,12 @@
 name: aesara-dev
 channels:
   - conda-forge
+  - numba
 dependencies:
   - python
   - compilers
-  - numpy>=1.17.0
-  - scipy>=0.14
+  - numpy>=1.17.0,<2.0.0
+  - scipy>=0.14,<=1.12.0
   - filelock
   - etuples
   - logical-unification
@@ -21,7 +22,7 @@ dependencies:
   - mkl-service
   - libblas=*=*mkl
   # numba backend
-  - numba>=0.55
+  - numba>=0.57.0,<0.58.0
   - numba-scipy
   # For testing
   - coveralls
@@ -29,19 +30,13 @@ dependencies:
   - pytest
   - pytest-cov
   - pytest-xdist
+  - pytest-benchmark
   # For building docs
   - sphinx>=1.3
   - sphinx_rtd_theme
   - pygments
   - pydot
   - ipython
-  # code style
-  - black
-  - isort
-  # For linting
-  - flake8
-  - pep8
-  - pyflakes
   # developer tools
   - pre-commit
   - packaging

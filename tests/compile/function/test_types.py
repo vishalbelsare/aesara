@@ -8,12 +8,14 @@ import aesara.tensor as at
 from aesara.compile import shared
 from aesara.compile.debugmode import DebugMode, InvalidValueError
 from aesara.compile.function import function
-from aesara.compile.function.types import UnusedInputError
+from aesara.compile.function.types import Supervisor, UnusedInputError
 from aesara.compile.io import In, Out
 from aesara.compile.mode import Mode, get_default_mode
+from aesara.compile.ops import update_placeholder
 from aesara.configdefaults import config
 from aesara.graph.basic import Constant
-from aesara.graph.opt import OpKeyOptimizer, PatternSub
+from aesara.graph.fg import FunctionGraph
+from aesara.graph.rewriting.basic import OpKeyGraphRewriter, PatternNodeRewriter
 from aesara.graph.utils import MissingInputError
 from aesara.link.vm import VMLinker
 from aesara.tensor.math import dot
@@ -32,10 +34,11 @@ from aesara.tensor.type import (
     vector,
 )
 from aesara.utils import exc_message
+from tests.graph.utils import MyVariable, op1
 
 
 def PatternOptimizer(p1, p2, ign=True):
-    return OpKeyOptimizer(PatternSub(p1, p2), ignore_newtrees=ign)
+    return OpKeyGraphRewriter(PatternNodeRewriter(p1, p2), ignore_newtrees=ign)
 
 
 class TestFunction:
@@ -766,6 +769,103 @@ class TestFunction:
 
             assert f._check_for_aliased_inputs, d
 
+    def test_output_dictionary(self):
+        # Tests that function works when outputs is a dictionary
+
+        x = scalar()
+        f = function([x], outputs={"a": x, "c": x * 2, "b": x * 3, "1": x * 4})
+
+        outputs = f(10.0)
+
+        assert outputs["a"] == 10.0
+        assert outputs["b"] == 30.0
+        assert outputs["1"] == 40.0
+        assert outputs["c"] == 20.0
+
+    def test_input_named_variables(self):
+        # Tests that named variables work when outputs is a dictionary
+
+        x = scalar("x")
+        y = scalar("y")
+
+        f = function([x, y], outputs={"a": x + y, "b": x * y})
+
+        assert f(2, 4) == {"a": 6, "b": 8}
+        assert f(2, y=4) == f(2, 4)
+        assert f(x=2, y=4) == f(2, 4)
+
+    def test_output_order_sorted(self):
+        # Tests that the output keys are sorted correctly.
+
+        x = scalar("x")
+        y = scalar("y")
+        z = scalar("z")
+        e1 = scalar("1")
+        e2 = scalar("2")
+
+        f = function(
+            [x, y, z, e1, e2], outputs={"x": x, "y": y, "z": z, "1": e1, "2": e2}
+        )
+
+        assert "1" in str(f.outputs[0])
+        assert "2" in str(f.outputs[1])
+        assert "x" in str(f.outputs[2])
+        assert "y" in str(f.outputs[3])
+        assert "z" in str(f.outputs[4])
+
+    def test_composing_function(self):
+        # Tests that one can compose two aesara functions when the outputs are
+        # provided in a dictionary.
+
+        x = scalar("x")
+        y = scalar("y")
+
+        a = x + y
+        b = x * y
+
+        f = function([x, y], outputs={"a": a, "b": b})
+
+        a = scalar("a")
+        b = scalar("b")
+
+        l = a + b
+        r = a * b
+
+        g = function([a, b], outputs=[l, r])
+
+        result = g(**f(5, 7))
+
+        assert result[0] == 47.0
+        assert result[1] == 420.0
+
+    def test_output_list_still_works(self):
+        # Test that function works if outputs is a list.
+
+        x = scalar("x")
+
+        f = function([x], outputs=[x * 3, x * 2, x * 4, x])
+
+        result = f(5.0)
+
+        assert result[0] == 15.0
+        assert result[1] == 10.0
+        assert result[2] == 20.0
+        assert result[3] == 5.0
+
+    def test_key_string_requirement(self):
+        # Tests that an exception is thrown if a non-string key is used in
+        # the outputs dictionary.
+        x = scalar("x")
+
+        with pytest.raises(AssertionError):
+            function([x], outputs={1.0: x})
+
+        with pytest.raises(AssertionError):
+            function([x], outputs={1.0: x, "a": x**2})
+
+        with pytest.raises(AssertionError):
+            function([x], outputs={(1, "b"): x, 1.0: x**2})
+
 
 class TestPicklefunction:
     def test_deepcopy(self):
@@ -802,7 +902,7 @@ class TestPicklefunction:
         assert f.maker.fgraph.name == g.maker.fgraph.name
         # print 'f.defaults = %s' % (f.defaults, )
         # print 'g.defaults = %s' % (g.defaults, )
-        for ((f_req, f_feed, f_val), (g_req, g_feed, g_val)) in zip(
+        for (f_req, f_feed, f_val), (g_req, g_feed, g_val) in zip(
             f.defaults, g.defaults
         ):
             assert f_req == g_req and f_feed == g_feed and f_val == g_val
@@ -1106,7 +1206,6 @@ class TestPicklefunction:
         fp2.close()
 
     def test_pickle_class_with_functions(self):
-
         blah = SomethingToPickle()
         assert blah.f2.container[blah.s].storage is blah.f1.container[blah.s].storage
 
@@ -1168,3 +1267,57 @@ def test_empty_givens_updates():
     y = x * 2
     function([In(x)], y, givens={})
     function([In(x)], y, updates={})
+
+
+def test_update_placeholder():
+    a, x, s, m, n = scalars("axsmn")
+
+    f1 = function(
+        [
+            x,
+            In(a, value=1.0, name="a"),
+            In(m, value=0.0, update=update_placeholder(m), mutable=True),
+            In(s, value=0.0, update=s + a * x, mutable=True),
+            In(n, value=0.0, update=update_placeholder(n), mutable=True),
+        ],
+        s + a * x,
+    )
+
+    # The second update shouldn't be present
+    assert len(f1.maker.fgraph.outputs) == 2
+    assert f1.maker.fgraph.update_mapping == {1: 3}
+
+
+class TestSupervisor:
+    def test_basic(self):
+        var1 = MyVariable("var1")
+        var2 = MyVariable("var2")
+        var3 = op1(var2, var1)
+        fg = FunctionGraph([var1, var2], [var3], clone=False)
+
+        hf = Supervisor([var1])
+        fg.attach_feature(hf)
+
+        assert fg._supervisor_protected == {var1}
+
+        # Make sure we can update the protected variables by
+        # adding another `Supervisor`
+        hf = Supervisor([var2])
+        fg.attach_feature(hf)
+
+        assert fg._supervisor_protected == {var1, var2}
+
+    def test_pickle(self):
+        var1 = MyVariable("var1")
+        var2 = MyVariable("var2")
+        var3 = op1(var2, var1)
+        fg = FunctionGraph([var1, var2], [var3], clone=False)
+
+        hf = Supervisor([var1])
+        fg.attach_feature(hf)
+
+        fg_pkld = pickle.dumps(fg)
+        fg_unpkld = pickle.loads(fg_pkld)
+
+        assert any(isinstance(ft, Supervisor) for ft in fg_unpkld._features)
+        assert all(hasattr(fg, attr) for attr in ("_supervisor_protected",))

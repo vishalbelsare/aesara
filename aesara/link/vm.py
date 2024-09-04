@@ -230,6 +230,7 @@ class VM(ABC):
         self.call_counts = [0] * len(nodes)
         self.call_times = [0] * len(nodes)
         self.time_thunks = False
+        self.storage_map: Optional[StorageMapType] = None
 
     @abstractmethod
     def __call__(self):
@@ -393,9 +394,9 @@ class Loop(UpdatingVM):
                 for thunk, node, old_storage in zip_longest(
                     self.thunks, self.nodes, self.post_thunk_clear, fillvalue=()
                 ):
-                    t0 = time.time()
+                    t0 = time.perf_counter()
                     thunk()
-                    t1 = time.time()
+                    t1 = time.perf_counter()
                     self.call_counts[i] += 1
                     self.call_times[i] += t1 - t0
                     for old_s in old_storage:
@@ -514,15 +515,15 @@ class Stack(UpdatingVM):
 
         """
         idx = self.node_idx[node]
-        t0 = time.time()
+        t0 = time.perf_counter()
         rval = self.thunks[idx]()
         self.node_executed_order.append(node)
 
         # Some thunks on some computers run faster than the granularity
-        # of the time.time clock.
+        # of the time.perf_counter clock.
         # Profile output looks buggy if a node has run but takes 0 time.
         # (and profile code might hide real bugs if it rounds up 0)
-        dt = max(time.time() - t0, 1e-10)
+        dt = max(time.perf_counter() - t0, 1e-10)
         if self.callback is not None:
             self.callback(
                 node=node,
@@ -626,7 +627,7 @@ class Stack(UpdatingVM):
                             # Computing the memory footprint of the the op
                             # ?? What about inplace .. if the op is inplace
                             # you don't actually ask for more memory!
-                            for (idx, o) in enumerate(
+                            for idx, o in enumerate(
                                 thunks[self.node_idx[current_apply]].outputs
                             ):
                                 var = self.nodes[current_idx].outputs[idx]
@@ -720,7 +721,7 @@ class Stack(UpdatingVM):
                             apply_stack.append(current_apply.inputs[r].owner)
                 else:
                     if config.profile or config.print_global_stats:
-                        for (idx, o) in enumerate(
+                        for idx, o in enumerate(
                             thunks[self.node_idx[current_apply]].outputs
                         ):
                             var = self.nodes[self.node_idx[current_apply]].outputs[idx]
@@ -1013,7 +1014,6 @@ class VMLinker(LocalLinker):
         compute_map,
         updated_vars,
     ):
-
         pre_call_clear = [storage_map[v] for v in self.no_recycling]
 
         try:
@@ -1027,7 +1027,6 @@ class VMLinker(LocalLinker):
             or ((config.profile or config.print_global_stats) and config.profile_memory)
             or (self.allow_partial_eval and not self.use_cloop)
         ):
-
             if self.use_cloop and (
                 self.callback is not None or self.callback_input is not None
             ):
@@ -1055,8 +1054,7 @@ class VMLinker(LocalLinker):
                 callback=self.callback,
                 callback_input=self.callback_input,
             )
-        elif self.use_cloop and CVM:
-
+        elif self.use_cloop and CVM is not None:
             # create a map from nodes to ints and vars to ints
             nodes_idx = {}
             vars_idx = {}
@@ -1069,9 +1067,9 @@ class VMLinker(LocalLinker):
 
             nodes_idx_inv = {}
             vars_idx_inv = {}
-            for (node, i) in nodes_idx.items():
+            for node, i in nodes_idx.items():
                 nodes_idx_inv[i] = node
-            for (var, i) in vars_idx.items():
+            for var, i in vars_idx.items():
                 vars_idx_inv[i] = var
 
             # put storage_map and compute_map into a int-based scheme
@@ -1110,7 +1108,7 @@ class VMLinker(LocalLinker):
 
             # build the var owner array
             var_owner = [None] * len(vars_idx)
-            for (var, i) in vars_idx.items():
+            for var, i in vars_idx.items():
                 if var.owner:
                     var_owner[i] = nodes_idx[var.owner]
 
@@ -1230,21 +1228,21 @@ class VMLinker(LocalLinker):
 
         thunks = []
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         linker_make_thunk_time = {}
         impl = None
         if self.c_thunks is False:
             impl = "py"
         for node in order:
             try:
-                thunk_start = time.time()
+                thunk_start = time.perf_counter()
                 # no-recycling is done at each VM.__call__ So there is
                 # no need to cause duplicate c code by passing
                 # no_recycling here.
                 thunks.append(
                     node.op.make_thunk(node, storage_map, compute_map, [], impl=impl)
                 )
-                linker_make_thunk_time[node] = time.time() - thunk_start
+                linker_make_thunk_time[node] = time.perf_counter() - thunk_start
                 if not hasattr(thunks[-1], "lazy"):
                     # We don't want all ops maker to think about lazy Ops.
                     # So if they didn't specify that its lazy or not, it isn't.
@@ -1253,7 +1251,7 @@ class VMLinker(LocalLinker):
             except Exception:
                 raise_with_op(fgraph, node)
 
-        t1 = time.time()
+        t1 = time.perf_counter()
 
         if self.profile:
             self.profile.linker_node_make_thunks += t1 - t0

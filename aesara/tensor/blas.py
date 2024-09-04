@@ -130,15 +130,13 @@ import os
 import time
 
 import numpy as np
-import numpy.distutils
 
 
 try:
-    import numpy.distutils.__config__  # noqa
+    import numpy.__config__  # noqa
 except ImportError:
     pass
 
-from functools import reduce
 from typing import Tuple, Union
 
 import aesara.scalar
@@ -147,27 +145,29 @@ from aesara.configdefaults import config
 from aesara.graph.basic import Apply, view_roots
 from aesara.graph.features import ReplacementDidNotRemoveError, ReplaceValidate
 from aesara.graph.op import Op
-from aesara.graph.opt import (
-    EquilibriumOptimizer,
-    GlobalOptimizer,
+from aesara.graph.rewriting.basic import (
+    EquilibriumGraphRewriter,
+    GraphRewriter,
     copy_stack_trace,
     in2out,
-    local_optimizer,
+    node_rewriter,
 )
-from aesara.graph.optdb import SequenceDB
+from aesara.graph.rewriting.db import SequenceDB
 from aesara.graph.utils import InconsistencyError, MethodNotDefined, TestValueError
 from aesara.link.c.op import COp
 from aesara.link.c.params_type import ParamsType
 from aesara.printing import FunctionPrinter, debugprint, pprint
 from aesara.scalar import bool as bool_t
 from aesara.tensor import basic as at
-from aesara.tensor.basic_opt import local_dimshuffle_lift
 from aesara.tensor.blas_headers import blas_header_text, blas_header_version
 from aesara.tensor.elemwise import DimShuffle, Elemwise
 from aesara.tensor.exceptions import NotScalarConstantError
 from aesara.tensor.math import Dot, add, mul, neg, sub
+from aesara.tensor.rewriting.elemwise import local_dimshuffle_lift
+from aesara.tensor.shape import specify_broadcastable
 from aesara.tensor.type import (
     DenseTensorType,
+    TensorType,
     integer_dtypes,
     tensor,
     values_eq_approx_remove_inf_nan,
@@ -530,11 +530,20 @@ class GemmRelated(COp):
         #ifndef MOD
         #define MOD %
         #endif
-        static double time_time() // a time function like time.time()
+        static double time_time() // a time function like time.perf_counter()
         {
             struct timeval tv;
             gettimeofday(&tv, 0);
             return (double) tv.tv_sec + (double) tv.tv_usec / 1000000.0;
+        }
+
+        void compute_strides(npy_intp *shape, int N_shape, int type_size, npy_intp *res) {
+            int s;
+            res[N_shape - 1] = type_size;
+            for (int i = N_shape - 1; i > 0; i--) {
+                s = shape[i];
+                res[i - 1] = res[i] * (s > 0 ? s : 1);
+            }
         }
         """
         return blas_header_text() + mod_str
@@ -630,8 +639,10 @@ class GemmRelated(COp):
         {PyErr_SetString(PyExc_NotImplementedError, "type(b) is not double or float"); %(fail)s;}
         """
 
+    # broadcast_xy = None
+
     check_dims = """
-        if (Nx[0] != Nz[0])
+        if (Nx[0] !=1 && Nz[0] != 1 && Nx[0] != Nz[0])
         {
             PyErr_Format(PyExc_ValueError,
                 "Shape mismatch: x has %%ld rows but z has %%ld rows",
@@ -645,7 +656,7 @@ class GemmRelated(COp):
                 (long int)Nx[1], (long int)Nx[0], (long int)Ny[0], (long int)Ny[1]);
             %(fail)s;
         }
-        if (Ny[1] != Nz[1])
+        if (Ny[1] != 1 && Nz[1]!= 1 && Ny[1] != Nz[1])
         {
             PyErr_Format(PyExc_ValueError,
                 "Shape mismatch: y has %%ld cols but z has %%ld cols",
@@ -671,6 +682,9 @@ class GemmRelated(COp):
             Py_XDECREF(%(_x)s);
             %(_x)s = _x_copy;
             Sx = PyArray_STRIDES(%(_x)s);
+            if ((Sx[0] < 1) || (Sx[1] < 1)) {
+                compute_strides(Nx, 2, type_size, Sx);
+            }
         }
 
         if ((Sy[0] < 1) || (Sy[1] < 1) || (Sy[0] MOD type_size) || (Sy[1] MOD type_size)
@@ -682,6 +696,9 @@ class GemmRelated(COp):
             Py_XDECREF(%(_y)s);
             %(_y)s = _y_copy;
             Sy = PyArray_STRIDES(%(_y)s);
+            if ((Sy[0] < 1) || (Sy[1] < 1)) {
+                compute_strides(Ny, 2, type_size, Sy);
+            }
         }
 
         if ((Sz[0] < 1) || (Sz[1] < 1) || (Sz[0] MOD type_size) || (Sz[1] MOD type_size)
@@ -693,6 +710,9 @@ class GemmRelated(COp):
             Py_XDECREF(%(_zout)s);
             %(_zout)s = _z_copy;
             Sz = PyArray_STRIDES(%(_zout)s);
+            if ((Sz[0] < 1) || (Sz[1] < 1)) {
+                compute_strides(Nz, 2, type_size, Sz);
+            }
         }
         """
 
@@ -822,14 +842,14 @@ class GemmRelated(COp):
         else:
             setup_z_Nz_Sz = self.setup_z_Nz_Sz
 
-        return reduce(
-            str.__add__,
+        return "".join(
             (
                 self.declare_NS,
                 self.check_xyz_rank2,
                 setup_z_Nz_Sz,
                 self.check_xyz_double_or_float,
                 self.check_ab_double_or_float,
+                self.broadcast_xy,
                 self.check_dims,
                 self.check_strides,
                 self.encode_strides_in_unit,
@@ -842,8 +862,7 @@ class GemmRelated(COp):
                 self.case_double_ab_constants,
                 self.case_double_gemm,
                 self.end_switch_typenum,
-            ),
-            "",
+            )
         )
 
     def build_gemm_version(self):
@@ -924,7 +943,7 @@ class Gemm(GemmRelated):
             )
         z, a, x, y, b = inputs
 
-        zr, xr, yr = [set(view_roots(i)) for i in (z, x, y)]
+        zr, xr, yr = (set(view_roots(i)) for i in (z, x, y))
 
         # We want the gemm to be inplace. When this op is inplace, it
         # declare to be inplace only on z. So to make it safe, we
@@ -973,6 +992,11 @@ class Gemm(GemmRelated):
             z.itemset(z * a + b * np.dot(x, y))
             zout[0] = z
         else:
+            # Broadcast Z if needed
+            if (x.shape[0] > z.shape[0]) or (y.shape[1] > z.shape[1]):
+                z = np.broadcast_to(
+                    z, (max(x.shape[0], z.shape[0]), max(y.shape[1], z.shape[1]))
+                ).copy()
             if b == 0.0:
                 if a == 1.0:
                     z[:] = np.dot(x, y)
@@ -993,88 +1017,135 @@ class Gemm(GemmRelated):
             zout[0] = z
 
     def infer_shape(self, fgraph, node, input_shapes):
-        return [input_shapes[0]]
+        z_shape, _, x_shape, y_shape, _ = input_shapes
+        return [
+            (
+                aesara.scalar.scalar_maximum(z_shape[0], x_shape[0]),
+                aesara.scalar.scalar_maximum(z_shape[1], y_shape[1]),
+            )
+        ]
 
     setup_z_Nz_Sz_inplace = """
-        if (%(_zout)s != %(_z)s)
-        {
-            if (%(_zout)s)
+        // Needs broadcasting
+        if (PyArray_DIMS(%(_z)s)[0] < Nx[0] || PyArray_DIMS(%(_z)s)[1] < Ny[1]){
+
+            npy_intp dims[2];
+            dims[0] = (PyArray_DIMS(%(_z)s)[0] >= Nx[0]) ? PyArray_DIMS(%(_z)s)[0] : Nx[0];
+            dims[1] = (PyArray_DIMS(%(_z)s)[1] >= Ny[1]) ? PyArray_DIMS(%(_z)s)[1] : Ny[1];
+
+            // Check if we need to allocate new array
+            if((NULL == %(_zout)s)
+                || (PyArray_DIMS(%(_zout)s)[0] != dims[0])
+                || (PyArray_DIMS(%(_zout)s)[1] != dims[1]))
             {
-                Py_DECREF(%(_zout)s);
+                // fprintf(stderr, "Gemm Allocating z output array with shape (%%i %%i)\\n", dims[0], dims[1]);
+                Py_XDECREF(%(_zout)s);
+                %(_zout)s = (PyArrayObject*)PyArray_SimpleNew(2, dims, PyArray_TYPE(%(_z)s));
             }
-            %(_zout)s = %(_z)s;
-            Py_INCREF(%(_zout)s);
+
+            // fprintf(stderr, "Gemm Broadcasting Z into shape (%%i %%i)\\n", dims[0], dims[1]);
+            if(PyArray_CopyInto(%(_zout)s, %(_z)s) == -1)
+            {
+                %(fail)s;
+            }
+
+        } else {
+            if (%(_zout)s != %(_z)s)
+            {
+                Py_XDECREF(%(_zout)s);
+                %(_zout)s = %(_z)s;
+                Py_INCREF(%(_zout)s);
+            }
         }
-        Nz = PyArray_DIMS(%(_z)s);
-        Sz = PyArray_STRIDES(%(_z)s);
+
+        Nz = PyArray_DIMS(%(_zout)s);
+        Sz = PyArray_STRIDES(%(_zout)s);
         """
 
     setup_z_Nz_Sz_outplace = """
+        npy_intp dims[2];
+        dims[0] = (PyArray_DIMS(%(_z)s)[0] >= Nx[0]) ? PyArray_DIMS(%(_z)s)[0] : Nx[0];
+        dims[1] = (PyArray_DIMS(%(_z)s)[1] >= Ny[1]) ? PyArray_DIMS(%(_z)s)[1] : Ny[1];
+
+        // Check if we need to allocate new array
         if ((NULL == %(_zout)s)
-            || (PyArray_DIMS(%(_zout)s)[0] != PyArray_DIMS(%(_z)s)[0])
-            || (PyArray_DIMS(%(_zout)s)[1] != PyArray_DIMS(%(_z)s)[1])
-            || (PyArray_STRIDES(%(_zout)s)[0] <= 0)
-            || (PyArray_STRIDES(%(_zout)s)[1] <= 0)
-            || (PyArray_STRIDES(%(_zout)s)[0] MOD type_size)
-            || (PyArray_STRIDES(%(_zout)s)[1] MOD type_size)
-            || ((PyArray_STRIDES(%(_zout)s)[0] != type_size)
-                && (PyArray_STRIDES(%(_zout)s)[1] != type_size)))
+            || (PyArray_DIMS(%(_zout)s)[0] != dims[0])
+            || (PyArray_DIMS(%(_zout)s)[1] != dims[1]))
         {
             Py_XDECREF(%(_zout)s);
-            npy_intp dims[2];
-            dims[0] = PyArray_DIMS(%(_z)s)[0];
-            dims[1] = PyArray_DIMS(%(_z)s)[1];
-            %(_zout)s = (PyArrayObject*)PyArray_SimpleNew(2, dims,
-                                                          PyArray_TYPE(%(_z)s));
-            //fprintf(stderr, "Gemm Allocating %%i %%i\\n", dims[0], dims[1]);
+            %(_zout)s = (PyArrayObject*)PyArray_SimpleNew(2, dims, PyArray_TYPE(%(_z)s));
+            // fprintf(stderr, "Gemm Allocating z output array with shape (%%i %%i)\\n", dims[0], dims[1]);
             if(!%(_zout)s) {
                 PyErr_SetString(PyExc_MemoryError,
                                 "failed to alloc gemm_no_inplace output");
                 %(fail)s
             }
         }
-        Nz = PyArray_DIMS(%(_zout)s);
-        Sz = PyArray_STRIDES(%(_zout)s);
 
-        if (PyArray_DESCR(%(_zout)s)->type_num == NPY_FLOAT)
+        // fprintf(stderr, "Gemm Broadcasting Z into shape (%%i %%i)\\n", dims[0], dims[1]);
+        if(PyArray_CopyInto(%(_zout)s, %(_z)s) == -1)
         {
-            float * zoutdata = (float*)PyArray_DATA(%(_zout)s);
-            int zoi = Sz[0] / sizeof(float);
-            int zoj = Sz[1] / sizeof(float);
-            const float * zdata = (float*)PyArray_DATA(%(_z)s);
-            int zi = PyArray_STRIDES(%(_z)s)[0]/sizeof(float);
-            int zj = PyArray_STRIDES(%(_z)s)[1]/sizeof(float);
-            for (int i = 0; i < Nz[0]; ++i)
-            {
-                for (int j = 0; j < Nz[1]; ++j)
-                {
-                    zoutdata[zoi*i + zoj*j] = zdata[zi*i + zj*j];
-                }
-            }
-        }
-        else if (PyArray_DESCR(%(_zout)s)->type_num == NPY_DOUBLE)
-        {
-            double * zoutdata = (double*) PyArray_DATA(%(_zout)s);
-            int zoi = Sz[0] / sizeof(double);
-            int zoj = Sz[1] / sizeof(double);
-            const double * zdata = (double*)PyArray_DATA(%(_z)s);
-            int zi = PyArray_STRIDES(%(_z)s)[0]/sizeof(double);
-            int zj = PyArray_STRIDES(%(_z)s)[1]/sizeof(double);
-            for (int i = 0; i < Nz[0]; ++i)
-            {
-                for (int j = 0; j < Nz[1]; ++j)
-                {
-                    zoutdata[zoi*i + zoj*j] = zdata[zi*i + zj*j];
-                }
-            }
-        }
-        else
-        {
-            PyErr_SetString(PyExc_AssertionError,
-                            "neither float nor double dtype");
             %(fail)s
         }
+
+        Nz = PyArray_DIMS(%(_zout)s);
+        Sz = PyArray_STRIDES(%(_zout)s);
         """
+
+    broadcast_xy = """
+        // Broadcast X if needed
+        if (Nz[0] > Nx[0])
+        {
+            npy_intp dims[2];
+            dims[0] = Nz[0];
+            dims[1] = Nx[1];
+            // fprintf(stderr, "Gemm Broadcasting X into shape (%%i %%i)\\n", dims[0], dims[1]);
+            PyArrayObject *x_new = (PyArrayObject*)PyArray_SimpleNew(2, dims, PyArray_TYPE(%(_x)s));
+            if(!x_new) {
+                PyErr_SetString(PyExc_MemoryError,
+                                "failed to alloc gemm_inplace input");
+                %(fail)s
+            }
+
+            if(PyArray_MoveInto(x_new, %(_x)s) == -1)
+            {
+                %(fail)s
+            }
+
+            Py_DECREF(%(_x)s);
+            %(_x)s = x_new;
+
+            Nx = PyArray_DIMS(%(_x)s);
+            Sx = PyArray_STRIDES(%(_x)s);
+        }
+
+        // Broadcast Y if needed
+        if (Nz[1] > Ny[1])
+        {
+            npy_intp dims[2];
+            dims[0] = Ny[0];
+            dims[1] = Nz[1];
+            // fprintf(stderr, "Gemm Broadcasting Y into shape (%%i %%i)\\n", dims[0], dims[1]);
+            PyArrayObject *y_new = (PyArrayObject*)PyArray_SimpleNew(2, dims, PyArray_TYPE(%(_x)s));
+            if(!y_new) {
+                PyErr_SetString(PyExc_MemoryError,
+                                "failed to alloc gemm_inplace input");
+                %(fail)s
+            }
+
+            if(PyArray_MoveInto(y_new, %(_y)s) == -1)
+            {
+                %(fail)s
+            }
+
+            Py_DECREF(%(_y)s);
+            %(_y)s = y_new;
+
+            Ny = PyArray_DIMS(%(_y)s);
+            Sy = PyArray_STRIDES(%(_y)s);
+        }
+
+    """
 
     case_float_ab_constants = """
         #define REAL float
@@ -1108,7 +1179,7 @@ class Gemm(GemmRelated):
     def c_code_cache_version(self):
         gv = self.build_gemm_version()
         if gv:
-            return (6,) + gv
+            return (7,) + gv
         else:
             return gv
 
@@ -1134,11 +1205,11 @@ def _as_scalar(res, dtype=None):
     """Return ``None`` or a `TensorVariable` of float type"""
     if dtype is None:
         dtype = config.floatX
-    if all(res.type.broadcastable):
+    if all(s == 1 for s in res.type.shape):
         while res.owner and isinstance(res.owner.op, DimShuffle):
             res = res.owner.inputs[0]
         # may still have some number of True's
-        if res.type.broadcastable:
+        if res.type.ndim > 0:
             rval = res.dimshuffle()
         else:
             rval = res
@@ -1160,8 +1231,8 @@ def _is_real_matrix(res):
     return (
         res.type.dtype in ("float16", "float32", "float64")
         and res.type.ndim == 2
-        and res.type.broadcastable[0] is False
-        and res.type.broadcastable[1] is False
+        and res.type.shape[0] != 1
+        and res.type.shape[1] != 1
     )  # cope with tuple vs. list
 
 
@@ -1169,7 +1240,7 @@ def _is_real_vector(res):
     return (
         res.type.dtype in ("float16", "float32", "float64")
         and res.type.ndim == 1
-        and res.type.broadcastable[0] is False
+        and res.type.shape[0] != 1
     )
 
 
@@ -1182,7 +1253,6 @@ def _beta_L_plus_alpha_M(fgraph, beta, L, alpha, M, recurse_flip=True):
     if M.owner and M.owner.op == _dot22:
         Ml, Mr = M.owner.inputs
         rval = [gemm_no_inplace(L, alpha, Ml, Mr, beta)]
-        # print 'GEMM 0', rval, beta, L, alpha, M
         return rval, M
 
     # it also might be the case that there is a dimshuffle between the +
@@ -1229,9 +1299,7 @@ def _gemm_canonicalize(fgraph, r, scale, rval, maxclients):
         else:
             return scale * thing
 
-    try:
-        r.type.broadcastable
-    except Exception:
+    if not isinstance(r.type, TensorType):
         return None
 
     if (r.type.ndim not in (1, 2)) or r.type.dtype not in (
@@ -1264,10 +1332,10 @@ def _gemm_canonicalize(fgraph, r, scale, rval, maxclients):
         vectors = []
         matrices = []
         for i in r.owner.inputs:
-            if all(i.type.broadcastable):
+            if all(s == 1 for s in i.type.shape):
                 while i.owner and isinstance(i.owner.op, DimShuffle):
                     i = i.owner.inputs[0]
-                if i.type.broadcastable:
+                if i.type.ndim > 0:
                     scalars.append(i.dimshuffle())
                 else:
                     scalars.append(i)
@@ -1396,7 +1464,6 @@ def _gemm_from_factored_list(fgraph, lst):
             )
             # print 'GOT IT', gemm_of_sM_list
             if gemm_of_sM_list:
-
                 assert len(gemm_of_sM_list) == 1
                 add_inputs = [
                     item_to_var(input) for k, input in enumerate(lst) if k not in (i, j)
@@ -1420,15 +1487,15 @@ def _gemm_from_node2(fgraph, node):
 
     """
     lst = []
-    t0 = time.time()
+    t0 = time.perf_counter()
     _gemm_canonicalize(fgraph, node.outputs[0], 1.0, lst, 0)
-    t1 = time.time()
+    t1 = time.perf_counter()
 
     if len(lst) > 1:
         lst = _factor_canonicalized(lst)
-        t2 = time.time()
+        t2 = time.perf_counter()
         rval = _gemm_from_factored_list(fgraph, lst)
-        t3 = time.time()
+        t3 = time.perf_counter()
 
         # It can happen that _factor_canonicalized and
         # _gemm_from_factored_list return a node with an incorrect
@@ -1445,7 +1512,7 @@ def _gemm_from_node2(fgraph, node):
     return None, t1 - t0, 0, 0
 
 
-class GemmOptimizer(GlobalOptimizer):
+class GemmOptimizer(GraphRewriter):
     """Graph optimizer for inserting Gemm operations."""
 
     def __init__(self):
@@ -1475,13 +1542,15 @@ class GemmOptimizer(GlobalOptimizer):
             if new_node is not node:
                 nodelist.append(new_node)
 
-        u = aesara.graph.opt.Updater(on_import, None, None, name="GemmOptimizer")
+        u = aesara.graph.rewriting.basic.DispatchingFeature(
+            on_import, None, None, name="GemmOptimizer"
+        )
         fgraph.attach_feature(u)
         while did_something:
             nb_iter += 1
-            t0 = time.time()
+            t0 = time.perf_counter()
             nodelist = aesara.graph.basic.io_toposort(fgraph.inputs, fgraph.outputs)
-            time_toposort += time.time() - t0
+            time_toposort += time.perf_counter() - t0
             did_something = False
             nodelist.reverse()
             for node in nodelist:
@@ -1565,10 +1634,10 @@ class GemmOptimizer(GlobalOptimizer):
             callbacks_time,
         )
 
-    @staticmethod
-    def print_profile(stream, prof, level=0):
+    @classmethod
+    def print_profile(cls, stream, prof, level=0):
         blanc = "    " * level
-        print(blanc, "GemmOptimizer", file=stream)
+        print(blanc, cls.__name__, file=stream)
         print(blanc, " nb_iter", prof[1], file=stream)
         print(blanc, " nb_replacement", prof[2], file=stream)
         print(blanc, " nb_replacement_didn_t_remove", prof[3], file=stream)
@@ -1610,8 +1679,7 @@ class Dot22(GemmRelated):
             raise TypeError(y)
         if y.type.dtype != x.type.dtype:
             raise TypeError("dtype mismatch to Dot22")
-        bz = (x.type.broadcastable[0], y.type.broadcastable[1])
-        outputs = [tensor(x.type.dtype, bz)]
+        outputs = [tensor(x.type.dtype, shape=(x.type.shape[0], y.type.shape[1]))]
         return Apply(self, [x, y], outputs)
 
     def perform(self, node, inp, out):
@@ -1650,6 +1718,7 @@ class Dot22(GemmRelated):
         Sz = PyArray_STRIDES(%(_zout)s);
 
         """
+    broadcast_xy = ""
     check_ab_double_or_float = ""
     case_float_ab_constants = """
                 float a = 1.0;
@@ -1681,7 +1750,7 @@ class Dot22(GemmRelated):
 _dot22 = Dot22()
 
 
-@local_optimizer([Dot])
+@node_rewriter([Dot])
 def local_dot_to_dot22(fgraph, node):
     # This works for tensor.outer too because basic.outer is a macro that
     # produces a dot(dimshuffle,dimshuffle) of form 4 below
@@ -1714,7 +1783,7 @@ def local_dot_to_dot22(fgraph, node):
     _logger.info(f"Not optimizing dot with inputs {x} {y} {x.type} {y.type}")
 
 
-@local_optimizer([gemm_no_inplace], inplace=True)
+@node_rewriter([gemm_no_inplace], inplace=True)
 def local_inplace_gemm(fgraph, node):
     if node.op == gemm_no_inplace:
         new_out = [gemm_inplace(*node.inputs)]
@@ -1722,7 +1791,7 @@ def local_inplace_gemm(fgraph, node):
         return new_out
 
 
-@local_optimizer([gemv_no_inplace], inplace=True)
+@node_rewriter([gemv_no_inplace], inplace=True)
 def local_inplace_gemv(fgraph, node):
     if node.op == gemv_no_inplace:
         new_out = [gemv_inplace(*node.inputs)]
@@ -1730,7 +1799,7 @@ def local_inplace_gemv(fgraph, node):
         return new_out
 
 
-@local_optimizer([ger], inplace=True)
+@node_rewriter([ger], inplace=True)
 def local_inplace_ger(fgraph, node):
     if node.op == ger:
         new_out = [ger_destructive(*node.inputs)]
@@ -1738,7 +1807,7 @@ def local_inplace_ger(fgraph, node):
         return new_out
 
 
-@local_optimizer([gemm_no_inplace])
+@node_rewriter([gemm_no_inplace])
 def local_gemm_to_gemv(fgraph, node):
     """GEMM acting on row or column matrices -> GEMV."""
     if node.op == gemm_no_inplace:
@@ -1755,7 +1824,7 @@ def local_gemm_to_gemv(fgraph, node):
         return new_out
 
 
-@local_optimizer([gemm_no_inplace])
+@node_rewriter([gemm_no_inplace])
 def local_gemm_to_ger(fgraph, node):
     """GEMM computing an outer-product -> GER."""
     if node.op == gemm_no_inplace:
@@ -1787,7 +1856,7 @@ def local_gemm_to_ger(fgraph, node):
 
 # TODO: delete this optimization when we have the proper dot->gemm->ger pipeline
 #      working
-@local_optimizer([_dot22])
+@node_rewriter([_dot22])
 def local_dot22_to_ger_or_gemv(fgraph, node):
     """dot22 computing an outer-product -> GER."""
     if node.op == _dot22:
@@ -1852,7 +1921,7 @@ blas_optdb.register(
 blas_optdb.register("gemm_optimizer", GemmOptimizer(), "fast_run", position=10)
 blas_optdb.register(
     "local_gemm_to_gemv",
-    EquilibriumOptimizer(
+    EquilibriumGraphRewriter(
         [
             local_gemm_to_gemv,
             local_gemm_to_ger,
@@ -1895,7 +1964,6 @@ class Dot22Scalar(GemmRelated):
     check_input = False
 
     def make_node(self, x, y, a):
-
         if any(not isinstance(i.type, DenseTensorType) for i in (x, y, a)):
             raise NotImplementedError("Only dense tensor types are supported")
 
@@ -1914,8 +1982,8 @@ class Dot22Scalar(GemmRelated):
         if not a.dtype.startswith("float") and not a.dtype.startswith("complex"):
             raise TypeError("Dot22Scalar requires float or complex args", a.dtype)
 
-        bz = [x.type.broadcastable[0], y.type.broadcastable[1]]
-        outputs = [tensor(x.type.dtype, bz)]
+        sz = (x.type.shape[0], y.type.shape[1])
+        outputs = [tensor(x.type.dtype, shape=sz)]
         return Apply(self, [x, y, a], outputs)
 
     def perform(self, node, inp, out):
@@ -1933,6 +2001,7 @@ class Dot22Scalar(GemmRelated):
         return [[input_shapes[0][0], input_shapes[1][1]]]
 
     setup_z_Nz_Sz = Dot22.setup_z_Nz_Sz
+    broadcast_xy = ""
 
     check_ab_double_or_float = """
         if ((PyArray_DESCR(%(_a)s)->type_num != NPY_DOUBLE)
@@ -1980,7 +2049,7 @@ class Dot22Scalar(GemmRelated):
 _dot22scalar = Dot22Scalar()
 
 
-@local_optimizer([mul])
+@node_rewriter([mul])
 def local_dot22_to_dot22scalar(fgraph, node):
     """
     Notes
@@ -2140,12 +2209,17 @@ class BatchedDot(COp):
         dtype = aesara.scalar.upcast(*[input.type.dtype for input in inputs])
         # upcast inputs to common dtype if needed
         upcasted_inputs = [at.cast(input, dtype) for input in inputs]
-        broadcastable = (
-            (inputs[0].type.broadcastable[0] or inputs[1].type.broadcastable[0],)
-            + inputs[0].type.broadcastable[1:-1]
-            + inputs[1].type.broadcastable[2:]
+        out_shape = (
+            (
+                1
+                if inputs[0].type.shape[0] == 1 or inputs[1].type.shape[0] == 1
+                else None,
+            )
+            + inputs[0].type.shape[1:-1]
+            + inputs[1].type.shape[2:]
         )
-        return Apply(self, upcasted_inputs, [tensor(dtype, broadcastable)])
+        out_shape = tuple(1 if s == 1 else None for s in out_shape)
+        return Apply(self, upcasted_inputs, [tensor(dtype, shape=out_shape)])
 
     def perform(self, node, inp, out):
         x, y = inp
@@ -2287,8 +2361,7 @@ class BatchedDot(COp):
                     ),
                     "(%s)"
                     % " || ".join(
-                        "{strides}[{i}] == type_size".format(strides=strides, i=i)
-                        for i in range(1, ndim)
+                        f"{strides}[{i}] == type_size" for i in range(1, ndim)
                     ),
                 ]
             )
@@ -2499,9 +2572,13 @@ class BatchedDot(COp):
         # above code don't always return the right broadcast pattern.
         # This cause problem down the road. See gh-1461.
         if xgrad.broadcastable != x.broadcastable:
-            xgrad = at.patternbroadcast(xgrad, x.broadcastable)
+            xgrad = specify_broadcastable(
+                xgrad, *(ax for (ax, b) in enumerate(x.type.broadcastable) if b)
+            )
         if ygrad.broadcastable != y.broadcastable:
-            ygrad = at.patternbroadcast(ygrad, y.broadcastable)
+            ygrad = specify_broadcastable(
+                ygrad, *(ax for (ax, b) in enumerate(y.type.broadcastable) if b)
+            )
 
         return xgrad, ygrad
 
@@ -2594,7 +2671,7 @@ _batched_dot = BatchedDot()
 
 # from opt import register_specialize, register_canonicalize
 # @register_specialize
-@local_optimizer([sub, add])
+@node_rewriter([sub, add])
 def local_print_as_we_go_along(fgraph, node):
     if node.op in (sub, add):
         debugprint(node)

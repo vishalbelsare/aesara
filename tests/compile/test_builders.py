@@ -7,21 +7,24 @@ import aesara.tensor as at
 from aesara.compile import shared
 from aesara.compile.builders import OpFromGraph
 from aesara.compile.function import function
+from aesara.compile.mode import get_mode
+from aesara.compile.ops import update_placeholder
+from aesara.compile.sharedvalue import SharedVariable
 from aesara.configdefaults import config
 from aesara.gradient import DisconnectedType, Rop, disconnected_type, grad
-from aesara.graph.basic import equal_computations
+from aesara.graph.basic import Constant, equal_computations
 from aesara.graph.fg import FunctionGraph
 from aesara.graph.null_type import NullType
-from aesara.graph.opt_utils import optimize_graph
+from aesara.graph.rewriting.utils import rewrite_graph
 from aesara.graph.utils import MissingInputError
 from aesara.printing import debugprint
 from aesara.tensor.basic import as_tensor
-from aesara.tensor.basic_opt import ShapeOptimizer
 from aesara.tensor.math import dot, exp
 from aesara.tensor.math import round as at_round
 from aesara.tensor.math import sigmoid
 from aesara.tensor.math import sum as at_sum
 from aesara.tensor.random.utils import RandomStream
+from aesara.tensor.rewriting.shape import ShapeOptimizer
 from aesara.tensor.shape import specify_shape
 from aesara.tensor.type import TensorType, matrices, matrix, scalar, vector, vectors
 from tests import unittest_tools
@@ -424,8 +427,8 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         assert results == expect_result
 
     def test_infer_shape(self):
-        # test infer shape does not need to against inline case
-        # since the Op is remove during optimization phase
+        # N.B. this test does not need to be run against the inline case,
+        # because the `Op` is supposed to be removed during optimization phase.
         x = matrix("x")
         y = matrix("y")
         o1 = x + y
@@ -455,7 +458,7 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         op_var = op_graph(x, y, z)
 
         fg = FunctionGraph(outputs=[op_var[1]], clone=False)
-        opt_res = optimize_graph(fg, custom_opt=ShapeOptimizer())
+        opt_res = rewrite_graph(fg, custom_rewrite=ShapeOptimizer())
 
         assert opt_res.shape_feature.shape_of[x] is None
         assert opt_res.shape_feature.shape_of[z][0].data == 2
@@ -560,6 +563,120 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
         # The original `op.fgraph` outputs should stay the same, though
         assert equal_computations(op.inner_outputs, [x**2 / x], op.inner_inputs, [x])
 
+    def test_default_updates(self):
+        """Make sure that default updates on shared variables raise errors."""
+
+        srng = at.random.RandomStream(1290984)
+        x = srng.gamma(0.5, 0.5, name="x")
+
+        srng = at.random.RandomStream(239)
+        y = srng.normal(x, name="y")
+
+        y_shared_variable = y.owner.inputs[0]
+        assert y_shared_variable.default_update is not None
+
+        # We don't want to in-place the RNG updates; that would avoid the
+        # update logic we're testing
+        mode = get_mode("FAST_RUN").excluding("inplace")
+
+        ofg = OpFromGraph([x], [y], inline=False, mode=mode)
+
+        x_val = at.as_tensor(0.0, dtype=x.type.dtype)
+        z = ofg(x_val)
+
+        z_fn = function([], z, mode=mode)
+
+        # The `y`'s mean should no longer be `x`
+        assert isinstance(z_fn.maker.fgraph.outputs[0].owner.inputs[0], Constant)
+
+        # There should be placeholder default updates in the resulting graph
+        (shared_variable,) = (
+            v for v in z_fn.maker.fgraph.variables if isinstance(v, SharedVariable)
+        )
+
+        placeholder_var = shared_variable.default_update
+        assert placeholder_var.owner.op == update_placeholder
+        assert placeholder_var.owner.inputs[0] is shared_variable
+
+        # Since this `OpFromGraph` wasn't inlined, we should've removed the
+        # placeholder update.
+        assert not z_fn.maker.fgraph.update_mapping
+
+        # The compiled inner-graph should be performing the RNG updates
+        ig_ofg = z_fn.maker.fgraph.outputs[0].owner.op
+        # `OpFromGraph`s are cloned
+        # TODO: It's always worth revisiting whether or not we should be doing
+        # this (and if/when we can go without it).
+        # assert ig_ofg is ofg
+        assert ig_ofg.fgraph.update_mapping == {1: 1}
+
+        srng_exp = at.random.RandomStream(239)
+        exp_fn = function([], srng_exp.normal(x_val, name="y"), mode=mode)
+
+        (exp_shared_variable,) = (
+            v for v in exp_fn.maker.fgraph.variables if isinstance(v, SharedVariable)
+        )
+        assert exp_shared_variable.default_update is not None
+
+        z_res = z_fn()
+        exp_res = exp_fn()
+
+        assert np.array_equal(z_res, exp_res)
+
+        # Execute again to make sure that the RNG is updated correctly
+        z_res_next = z_fn()
+        exp_res_next = exp_fn()
+
+        # Make sure nothing weird is going on here
+        assert not np.array_equal(exp_res, exp_res_next)
+
+        assert np.array_equal(z_res_next, exp_res_next)
+
+    def test_default_updates_inlined(self):
+        srng = at.random.RandomStream(1290984)
+        x = srng.gamma(0.5, 0.5, name="x")
+
+        srng = at.random.RandomStream(239)
+        y = srng.normal(x, name="y")
+
+        y_shared_variable = y.owner.inputs[0]
+        assert y_shared_variable.default_update is not None
+
+        mode = get_mode("FAST_RUN").excluding("inplace")
+
+        ofg = OpFromGraph([x], [y], inline=True, mode=mode)
+
+        x_val = at.as_tensor(0.0, dtype=x.type.dtype)
+        z = ofg(x_val)
+
+        z_fn = function([], z, mode=mode)
+
+        assert not any(
+            isinstance(node.op, OpFromGraph) for node in z_fn.maker.fgraph.apply_nodes
+        )
+
+        srng_exp = at.random.RandomStream(239)
+        exp_fn = function([], srng_exp.normal(x_val, name="y"), mode=mode)
+
+        (exp_shared_variable,) = (
+            v for v in exp_fn.maker.fgraph.variables if isinstance(v, SharedVariable)
+        )
+        assert exp_shared_variable.default_update is not None
+
+        z_res = z_fn()
+        exp_res = exp_fn()
+
+        assert np.array_equal(z_res, exp_res)
+
+        # Execute again to make sure that the RNG is updated correctly
+        z_res_next = z_fn()
+        exp_res_next = exp_fn()
+
+        # Make sure nothing weird is going on here
+        assert not np.array_equal(exp_res, exp_res_next)
+
+        assert np.array_equal(z_res_next, exp_res_next)
+
 
 @config.change_flags(floatX="float64")
 def test_debugprint():
@@ -580,10 +697,10 @@ Inner graphs:
 
 OpFromGraph{inline=False} [id A]
  >Elemwise{add,no_inplace} [id E]
- > |*0-<TensorType(float64, (None, None))> [id F]
+ > |*0-<TensorType(float64, (?, ?))> [id F]
  > |Elemwise{mul,no_inplace} [id G]
- >   |*1-<TensorType(float64, (None, None))> [id H]
- >   |*2-<TensorType(float64, (None, None))> [id I]
+ >   |*1-<TensorType(float64, (?, ?))> [id H]
+ >   |*2-<TensorType(float64, (?, ?))> [id I]
 """
 
     for truth, out in zip(exp_res.split("\n"), lines):

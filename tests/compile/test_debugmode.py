@@ -18,11 +18,11 @@ from aesara.configdefaults import config
 from aesara.graph.basic import Apply, Variable
 from aesara.graph.features import BadOptimization
 from aesara.graph.op import Op
-from aesara.graph.opt import local_optimizer
-from aesara.graph.optdb import EquilibriumDB
+from aesara.graph.rewriting.basic import node_rewriter
+from aesara.graph.rewriting.db import EquilibriumDB
 from aesara.link.c.op import COp
 from aesara.tensor.math import add, dot, log
-from aesara.tensor.type import TensorType, dvector, fmatrix, fvector, vector
+from aesara.tensor.type import TensorType, dvector, fmatrix, fvector, scalar, vector
 from tests import unittest_tools as utt
 
 
@@ -33,7 +33,6 @@ def test_debugmode_basic():
 
 
 class BROKEN_ON_PURPOSE_Add(COp):
-
     __props__ = ("py_offset",)
 
     def __init__(self, py_offset):
@@ -237,7 +236,7 @@ def test_badthunkoutput():
 
 
 def test_badoptimization():
-    @local_optimizer([add])
+    @node_rewriter([add])
     def insert_broken_add(fgraph, node):
         if node.op == add:
             return [off_by_half(*node.inputs)]
@@ -263,7 +262,7 @@ def test_badoptimization():
 def test_badoptimization_opt_err():
     # This variant of test_badoptimization() replace the working code
     # with a new apply node that will raise an error.
-    @local_optimizer([add])
+    @node_rewriter([add])
     def insert_bigger_b_add(fgraph, node):
         if node.op == add:
             inputs = list(node.inputs)
@@ -272,12 +271,11 @@ def test_badoptimization_opt_err():
                 return [node.op(*inputs)]
         return False
 
-    @local_optimizer([add])
+    @node_rewriter([add])
     def insert_bad_dtype(fgraph, node):
         if node.op == add:
             inputs = list(node.inputs)
             if inputs[-1].owner is None:
-
                 return [node.outputs[0].astype("float32")]
         return False
 
@@ -321,12 +319,11 @@ def test_badoptimization_opt_err():
 
 
 def test_stochasticoptimization():
-
     # this optimization alternates between triggering and not triggering.
 
     last_time_replaced = [False]
 
-    @local_optimizer([add])
+    @node_rewriter([add])
     def insert_broken_add_sometimes(fgraph, node):
         if node.op == add:
             last_time_replaced[0] = not last_time_replaced[0]
@@ -611,7 +608,6 @@ class TestCheckIsfinite:
 
 
 class BrokenCImplementationAdd(COp):
-
     __props__ = ()
 
     def make_node(self, a, b):
@@ -716,8 +712,8 @@ class VecAsRowAndCol(Op):
             v = at.as_tensor_variable(v)
         assert v.type.ndim == 1
         type_class = type(v.type)
-        out_r_type = type_class(dtype=v.dtype, shape=(True, False))
-        out_c_type = type_class(dtype=v.dtype, shape=(False, True))
+        out_r_type = type_class(dtype=v.dtype, shape=(1, None))
+        out_c_type = type_class(dtype=v.dtype, shape=(None, 1))
         return Apply(self, [v], [out_r_type(), out_c_type()])
 
     def perform(self, node, inp, out):
@@ -725,10 +721,10 @@ class VecAsRowAndCol(Op):
         r, c = out
         lv = v.shape[0]
         if (r[0] is None) or (r[0].shape != (1, lv)):
-            r[0] = node.outputs[0].type.value_zeros((1, lv))
+            r[0] = np.empty((1, lv), dtype=node.outputs[0].type.dtype)
 
         if (c[0] is None) or (c[0].shape != (lv, 1)):
-            c[0] = node.outputs[1].type.value_zeros((lv, 1))
+            c[0] = np.empty((lv, 1), dtype=node.outputs[0].type.dtype)
 
         for i in range(lv):
             r[0][0, i] = v[i]
@@ -806,5 +802,33 @@ class TestPreallocatedOutput:
         c, r = VecAsRowAndCol()(v)
         f = function([v], [c, r])
 
-        v_val = self.rng.standard_normal((5)).astype("float32")
+        v_val = self.rng.standard_normal(5).astype("float32")
         f(v_val)
+
+
+def test_function_dict():
+    """Tests that debug mode works where outputs is a dictionary."""
+
+    x = scalar("x")
+
+    f = function([x], outputs={"1": x, "2": 2 * x, "3": 3 * x}, mode="DEBUG_MODE")
+
+    result = f(3.0)
+
+    assert result["1"] == 3.0
+    assert result["2"] == 6.0
+    assert result["3"] == 9.0
+
+
+def test_function_list():
+    """Tests that debug mode works where the outputs argument is a list."""
+
+    x = scalar("x")
+
+    f = function([x], outputs=[x, 2 * x, 3 * x], mode="DEBUG_MODE")
+
+    result = f(5.0)
+
+    assert result[0] == 5.0
+    assert result[1] == 10.0
+    assert result[2] == 15.0

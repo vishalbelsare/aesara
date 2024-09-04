@@ -2,7 +2,6 @@ import functools
 import itertools
 
 import numpy as np
-import numpy.linalg
 import pytest
 import scipy
 
@@ -12,7 +11,6 @@ from aesara import tensor as at
 from aesara.configdefaults import config
 from aesara.tensor.slinalg import (
     Cholesky,
-    CholeskyGrad,
     CholeskySolve,
     Solve,
     SolveBase,
@@ -23,6 +21,8 @@ from aesara.tensor.slinalg import (
     expm,
     kron,
     solve,
+    solve_continuous_lyapunov,
+    solve_discrete_lyapunov,
     solve_triangular,
 )
 from aesara.tensor.type import dmatrix, matrix, tensor, vector
@@ -121,22 +121,17 @@ def test_cholesky_grad_indef():
 
 
 @pytest.mark.slow
-def test_cholesky_and_cholesky_grad_shape():
+def test_cholesky_shape():
     rng = np.random.default_rng(utt.fetch_seed())
     x = matrix()
     for l in (cholesky(x), Cholesky(lower=True)(x), Cholesky(lower=False)(x)):
         f_chol = aesara.function([x], l.shape)
-        g = aesara.gradient.grad(l.sum(), x)
-        f_cholgrad = aesara.function([x], g.shape)
         topo_chol = f_chol.maker.fgraph.toposort()
-        topo_cholgrad = f_cholgrad.maker.fgraph.toposort()
         if config.mode != "FAST_COMPILE":
             assert sum(node.op.__class__ == Cholesky for node in topo_chol) == 0
-            assert sum(node.op.__class__ == CholeskyGrad for node in topo_cholgrad) == 0
         for shp in [2, 3, 5]:
             m = np.cov(rng.standard_normal((shp, shp + 10))).astype(config.floatX)
             np.testing.assert_equal(f_chol(m), (shp, shp))
-            np.testing.assert_equal(f_cholgrad(m), (shp, shp))
 
 
 def test_eigvalsh():
@@ -178,13 +173,13 @@ class TestSolveBase(utt.InferShapeTester):
         [
             (vector, matrix, "`A` must be a matrix.*"),
             (
-                functools.partial(tensor, dtype="floatX", shape=(False,) * 3),
+                functools.partial(tensor, dtype="floatX", shape=(None,) * 3),
                 matrix,
                 "`A` must be a matrix.*",
             ),
             (
                 matrix,
-                functools.partial(tensor, dtype="floatX", shape=(False,) * 3),
+                functools.partial(tensor, dtype="floatX", shape=(None,) * 3),
                 "`b` must be a matrix or a vector.*",
             ),
         ],
@@ -391,7 +386,7 @@ class TestCholeskySolve(utt.InferShapeTester):
             # A must be square
             [
                 np.asarray(rng.random((5, 5)), dtype=config.floatX),
-                np.asarray(rng.random((5)), dtype=config.floatX),
+                np.asarray(rng.random(5), dtype=config.floatX),
             ],
             self.op_class,
             warn=False,
@@ -497,7 +492,7 @@ def test_expm_grad_2():
     rng = np.random.default_rng(utt.fetch_seed())
     # Always test in float64 for better numerical stability.
     A = rng.standard_normal((5, 5))
-    w = rng.standard_normal((5)) ** 2
+    w = rng.standard_normal(5) ** 2
     A = (np.diag(w**0.5)).dot(A + A.T).dot(np.diag(w ** (-0.5)))
     assert not np.allclose(A, A.T)
 
@@ -514,7 +509,6 @@ def test_expm_grad_3():
 
 
 class TestKron(utt.InferShapeTester):
-
     rng = np.random.default_rng(43)
 
     def setup_method(self):
@@ -523,12 +517,12 @@ class TestKron(utt.InferShapeTester):
 
     def test_perform(self):
         for shp0 in [(2,), (2, 3), (2, 3, 4), (2, 3, 4, 5)]:
-            x = tensor(dtype="floatX", shape=(False,) * len(shp0))
+            x = tensor(dtype="floatX", shape=(None,) * len(shp0))
             a = np.asarray(self.rng.random(shp0)).astype(config.floatX)
             for shp1 in [(6,), (6, 7), (6, 7, 8), (6, 7, 8, 9)]:
                 if len(shp0) + len(shp1) == 2:
                     continue
-                y = tensor(dtype="floatX", shape=(False,) * len(shp1))
+                y = tensor(dtype="floatX", shape=(None,) * len(shp1))
                 f = function([x, y], kron(x, y))
                 b = self.rng.random(shp1).astype(config.floatX)
                 out = f(a, b)
@@ -542,13 +536,77 @@ class TestKron(utt.InferShapeTester):
 
     def test_numpy_2d(self):
         for shp0 in [(2, 3)]:
-            x = tensor(dtype="floatX", shape=(False,) * len(shp0))
+            x = tensor(dtype="floatX", shape=(None,) * len(shp0))
             a = np.asarray(self.rng.random(shp0)).astype(config.floatX)
             for shp1 in [(6, 7)]:
                 if len(shp0) + len(shp1) == 2:
                     continue
-                y = tensor(dtype="floatX", shape=(False,) * len(shp1))
+                y = tensor(dtype="floatX", shape=(None,) * len(shp1))
                 f = function([x, y], kron(x, y))
                 b = self.rng.random(shp1).astype(config.floatX)
                 out = f(a, b)
                 assert np.allclose(out, np.kron(a, b))
+
+
+def test_solve_discrete_lyapunov_via_direct_real():
+    N = 5
+    rng = np.random.default_rng(utt.fetch_seed())
+    a = at.dmatrix()
+    q = at.dmatrix()
+    f = function([a, q], [solve_discrete_lyapunov(a, q, method="direct")])
+
+    A = rng.normal(size=(N, N))
+    Q = rng.normal(size=(N, N))
+
+    X = f(A, Q)
+    assert np.allclose(A @ X @ A.T - X + Q, 0.0)
+
+    utt.verify_grad(solve_discrete_lyapunov, pt=[A, Q], rng=rng)
+
+
+def test_solve_discrete_lyapunov_via_direct_complex():
+    N = 5
+    rng = np.random.default_rng(utt.fetch_seed())
+    a = at.zmatrix()
+    q = at.zmatrix()
+    f = function([a, q], [solve_discrete_lyapunov(a, q, method="direct")])
+
+    A = rng.normal(size=(N, N)) + rng.normal(size=(N, N)) * 1j
+    Q = rng.normal(size=(N, N))
+    X = f(A, Q)
+    assert np.allclose(A @ X @ A.conj().T - X + Q, 0.0)
+
+    # TODO: the .conj() method currently does not have a gradient; add this test when gradients are implemented.
+    # utt.verify_grad(solve_discrete_lyapunov, pt=[A, Q], rng=rng)
+
+
+def test_solve_discrete_lyapunov_via_bilinear():
+    N = 5
+    rng = np.random.default_rng(utt.fetch_seed())
+    a = at.dmatrix()
+    q = at.dmatrix()
+    f = function([a, q], [solve_discrete_lyapunov(a, q, method="bilinear")])
+
+    A = rng.normal(size=(N, N))
+    Q = rng.normal(size=(N, N))
+
+    X = f(A, Q)
+    assert np.allclose(A @ X @ A.conj().T - X + Q, 0.0)
+
+    utt.verify_grad(solve_discrete_lyapunov, pt=[A, Q], rng=rng)
+
+
+def test_solve_continuous_lyapunov():
+    N = 5
+    rng = np.random.default_rng(utt.fetch_seed())
+    a = at.dmatrix()
+    q = at.dmatrix()
+    f = function([a, q], [solve_continuous_lyapunov(a, q)])
+
+    A = rng.normal(size=(N, N))
+    Q = rng.normal(size=(N, N))
+    X = f(A, Q)
+
+    assert np.allclose(A @ X + X @ A.conj().T, Q)
+
+    utt.verify_grad(solve_continuous_lyapunov, pt=[A, Q], rng=rng)

@@ -1,17 +1,21 @@
 name: aesara-docs
 channels:
-  - defaults
   - conda-forge
+  - nodefaults
 dependencies:
-  - python=3.7
+  - python=3.9
   - gcc_linux-64
   - gxx_linux-64
   - numpy
   - scipy
   - six
-  - sphinx>=3
+  - sphinx>=3,<7
+  - sphinx-book-theme
+  - sphinx-design
   - sphinx_rtd_theme
+  - jinja2<3.1.0
   - mock
   - pillow
+  - pip
   - pip:
     - -e ..[doc]

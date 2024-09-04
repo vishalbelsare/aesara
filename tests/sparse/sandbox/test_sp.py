@@ -35,13 +35,12 @@ class TestSP:
         input = dmatrix()
         rng = np.random.default_rng(3423489)
         filters = rng.standard_normal((nkern, np.prod(kshp)))
-        biasvals = rng.standard_normal((nkern))
+        biasvals = rng.standard_normal(nkern)
 
         for mode in ("FAST_COMPILE", "FAST_RUN"):
             ttot, ntot = 0, 0
             for conv_mode in convmodes:
                 for ss in ssizes:
-
                     output, outshp = sp.convolve(
                         kerns, kshp, nkern, input, imshp, ss, bias=bias, mode=conv_mode
                     )
@@ -64,14 +63,14 @@ class TestSP:
                         fulloutshp = np.array(imshp) - np.array(kshp) + 1
                     else:
                         fulloutshp = np.array(imshp) + np.array(kshp) - 1
-                    ntime1 = time.time()
+                    ntime1 = time.perf_counter()
                     refout = np.zeros((bsize,) + tuple(fulloutshp) + (nkern,))
                     for b in range(bsize):
                         for n in range(nkern):
                             refout[b, ..., n] = convolve2d(
                                 img2d[b, :, :], filtersflipped[n, ...], conv_mode
                             )
-                    ntot += time.time() - ntime1
+                    ntot += time.perf_counter() - ntime1
 
                     # need to flatten images
                     bench1 = refout[:, 0 :: ss[0], 0 :: ss[1], :].reshape(
@@ -81,9 +80,9 @@ class TestSP:
 
                     # swap the last two dimensions (output needs to be nkern x outshp)
                     bench1 = np.swapaxes(bench1, 1, 2)
-                    ttime1 = time.time()
+                    ttime1 = time.perf_counter()
                     out1 = f(filters, biasvals, img1d)
-                    ttot += time.time() - ttime1
+                    ttot += time.perf_counter() - ttime1
                     temp = bench1.flatten() - out1.flatten()
 
                     assert (temp < 1e-5).all()
@@ -141,7 +140,6 @@ class TestSP:
         for mode in ("FAST_COMPILE", "FAST_RUN"):
             for conv_mode in convmodes:
                 for ss in ssizes:
-
                     l1hid, l1shp = sp.convolve(
                         kerns[0],
                         kshp[0],
@@ -186,7 +184,6 @@ class TestSP:
 
         images = dmatrix()
         for maxpoolshp in maxpoolshps:
-
             # symbolic stuff
             output, outshp = sp.max_pool(images, imval.shape[1:], maxpoolshp)
             f = function(

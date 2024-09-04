@@ -8,6 +8,7 @@ import aesara.tensor as at
 from aesara.configdefaults import config
 from aesara.tensor.math import sum as at_sum
 from aesara.tensor.nnet import batchnorm
+from aesara.tensor.shape import specify_broadcastable
 from aesara.tensor.type import (
     TensorType,
     matrix,
@@ -21,7 +22,6 @@ from tests import unittest_tools as utt
 
 
 def test_BNComposite():
-
     with config.change_flags(compute_test_value="raise"):
 
         def bn_ref(x, G, B, M, V):
@@ -42,10 +42,10 @@ def test_BNComposite():
         v = vector("v")
 
         x.tag.test_value = rng.random((2, 2)).astype(aesara.config.floatX)
-        b.tag.test_value = rng.random((2)).astype(aesara.config.floatX)
-        g.tag.test_value = rng.random((2)).astype(aesara.config.floatX)
-        m.tag.test_value = rng.random((2)).astype(aesara.config.floatX)
-        v.tag.test_value = rng.random((2)).astype(aesara.config.floatX)
+        b.tag.test_value = rng.random(2).astype(aesara.config.floatX)
+        g.tag.test_value = rng.random(2).astype(aesara.config.floatX)
+        m.tag.test_value = rng.random(2).astype(aesara.config.floatX)
+        v.tag.test_value = rng.random(2).astype(aesara.config.floatX)
 
         bn_ref_op = bn_ref(x, g, b, m, v)
         f_ref = aesara.function([x, b, g, m, v], [bn_ref_op])
@@ -175,7 +175,6 @@ def test_bn_feature_maps():
 
 @pytest.mark.slow
 def test_batch_normalization_train():
-
     for axes in ("per-activation", "spatial", (1, 2, 3, 4)):
         for vartype in (tensor5, tensor3, vector):
             x, scale, bias, running_mean, running_var = (
@@ -219,8 +218,8 @@ def test_batch_normalization_train():
             x_mean2 = x.mean(axis=axes2, keepdims=True)
             x_var2 = x.var(axis=axes2, keepdims=True)
             x_invstd2 = at.reciprocal(at.sqrt(x_var2 + eps))
-            scale2 = at.addbroadcast(scale, *axes2)
-            bias2 = at.addbroadcast(bias, *axes2)
+            scale2 = specify_broadcastable(scale, *axes2)
+            bias2 = specify_broadcastable(bias, *axes2)
             out2 = (x - x_mean2) * (scale2 * x_invstd2) + bias2
             m = at.cast(at.prod(x.shape) / at.prod(scale.shape), aesara.config.floatX)
             out_running_mean2 = (
@@ -355,7 +354,6 @@ def test_batch_normalization_train():
 
 @pytest.mark.slow
 def test_batch_normalization_train_grad_grad():
-
     for axes in ("per-activation", "spatial", (1, 2, 3, 4)):
         for vartype in (tensor5, tensor4, tensor3, matrix, vector):
             # run these experiments with float64 for sufficient numerical stability
@@ -494,7 +492,7 @@ def test_batch_normalization_train_broadcast():
                 params_dimshuffle[axis] = i
 
             # construct non-broadcasted parameter variables
-            param_type = TensorType(x.dtype, (False,) * len(non_bc_axes))
+            param_type = TensorType(x.dtype, shape=(None,) * len(non_bc_axes))
             scale, bias, running_mean, running_var = (
                 param_type(n) for n in ("scale", "bias", "running_mean", "running_var")
             )
@@ -557,7 +555,7 @@ def test_batch_normalization_train_broadcast():
                 assert len(nodes) == 1
                 assert isinstance(nodes[0].op, aesara.compile.DeepCopyOp)
             inputs = [
-                np.asarray(np.random.random(((4,) * n)), x.dtype)
+                np.asarray(np.random.random((4,) * n), x.dtype)
                 for n in [
                     x.ndim,
                     scale.ndim,
@@ -597,7 +595,7 @@ def test_batch_normalization_test():
             else:
                 axes2 = axes
             scale2, bias2, mean2, var2 = (
-                at.addbroadcast(t, *axes2) for t in (scale, bias, mean, var)
+                specify_broadcastable(t, *axes2) for t in (scale, bias, mean, var)
             )
             out2 = (x - mean2) * (scale2 / at.sqrt(var2 + eps)) + bias2
             # backward pass

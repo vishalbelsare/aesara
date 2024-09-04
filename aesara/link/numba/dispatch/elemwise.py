@@ -12,6 +12,7 @@ from aesara.graph.basic import Apply
 from aesara.graph.op import Op
 from aesara.link.numba.dispatch import basic as numba_basic
 from aesara.link.numba.dispatch.basic import (
+    _numba_funcify,
     create_numba_signature,
     create_tuple_creator,
     numba_funcify,
@@ -27,19 +28,19 @@ from aesara.scalar.basic import (
     OR,
     XOR,
     Add,
-    IntDiv,
+    FloorDivide,
     Mean,
     Mul,
     ScalarMaximum,
     ScalarMinimum,
     Sub,
-    TrueDiv,
+    TrueDivide,
 )
 from aesara.scalar.basic import add as add_as
 from aesara.scalar.basic import scalar_maximum
 from aesara.tensor.elemwise import CAReduce, DimShuffle, Elemwise
 from aesara.tensor.math import MaxAndArgmax, MulWithoutZeros
-from aesara.tensor.nnet.basic import LogSoftmax, Softmax, SoftmaxGrad
+from aesara.tensor.special import LogSoftmax, Softmax, SoftmaxGrad
 
 
 @singledispatch
@@ -100,12 +101,12 @@ def scalar_in_place_fn_XOR(op, idx, res, arr):
     return f"{res}[{idx}] ^= {arr}"
 
 
-@scalar_in_place_fn.register(TrueDiv)
+@scalar_in_place_fn.register(TrueDivide)
 def scalar_in_place_fn_TrueDiv(op, idx, res, arr):
     return f"{res}[{idx}] /= {arr}"
 
 
-@scalar_in_place_fn.register(IntDiv)
+@scalar_in_place_fn.register(FloorDivide)
 def scalar_in_place_fn_IntDiv(op, idx, res, arr):
     return f"{res}[{idx}] //= {arr}"
 
@@ -422,9 +423,8 @@ def create_axis_apply_fn(fn, axis, ndim, dtype):
     return axis_apply_fn
 
 
-@numba_funcify.register(Elemwise)
+@_numba_funcify.register(Elemwise)
 def numba_funcify_Elemwise(op, node, **kwargs):
-
     scalar_op_fn = numba_funcify(op.scalar_op, node=node, inline="always", **kwargs)
     elemwise_fn = create_vectorize_func(scalar_op_fn, node, use_signature=False)
     elemwise_fn_name = elemwise_fn.__name__
@@ -474,7 +474,7 @@ def {inplace_elemwise_fn_name}({input_signature_str}):
     return elemwise_fn
 
 
-@numba_funcify.register(CAReduce)
+@_numba_funcify.register(CAReduce)
 def numba_funcify_CAReduce(op, node, **kwargs):
     axes = op.axis
     if axes is None:
@@ -512,7 +512,7 @@ def numba_funcify_CAReduce(op, node, **kwargs):
     return careduce_fn
 
 
-@numba_funcify.register(DimShuffle)
+@_numba_funcify.register(DimShuffle)
 def numba_funcify_DimShuffle(op, **kwargs):
     shuffle = tuple(op.shuffle)
     transposition = tuple(op.transposition)
@@ -590,9 +590,8 @@ def numba_funcify_DimShuffle(op, **kwargs):
     return dimshuffle
 
 
-@numba_funcify.register(Softmax)
+@_numba_funcify.register(Softmax)
 def numba_funcify_Softmax(op, node, **kwargs):
-
     x_at = node.inputs[0]
     x_dtype = x_at.type.numpy_dtype
     x_dtype = numba.np.numpy_support.from_dtype(x_dtype)
@@ -627,9 +626,8 @@ def numba_funcify_Softmax(op, node, **kwargs):
     return softmax
 
 
-@numba_funcify.register(SoftmaxGrad)
+@_numba_funcify.register(SoftmaxGrad)
 def numba_funcify_SoftmaxGrad(op, node, **kwargs):
-
     sm_at = node.inputs[1]
     sm_dtype = sm_at.type.numpy_dtype
     sm_dtype = numba.np.numpy_support.from_dtype(sm_dtype)
@@ -658,9 +656,8 @@ def numba_funcify_SoftmaxGrad(op, node, **kwargs):
     return softmax_grad
 
 
-@numba_funcify.register(LogSoftmax)
+@_numba_funcify.register(LogSoftmax)
 def numba_funcify_LogSoftmax(op, node, **kwargs):
-
     x_at = node.inputs[0]
     x_dtype = x_at.type.numpy_dtype
     x_dtype = numba.np.numpy_support.from_dtype(x_dtype)
@@ -692,7 +689,7 @@ def numba_funcify_LogSoftmax(op, node, **kwargs):
     return log_softmax
 
 
-@numba_funcify.register(MaxAndArgmax)
+@_numba_funcify.register(MaxAndArgmax)
 def numba_funcify_MaxAndArgmax(op, node, **kwargs):
     axis = op.axis
     x_at = node.inputs[0]
@@ -707,7 +704,6 @@ def numba_funcify_MaxAndArgmax(op, node, **kwargs):
             return x, 0
 
     else:
-
         axes = tuple(int(ax) for ax in axis)
 
         # NumPy does not support multiple axes for argmax; this is a

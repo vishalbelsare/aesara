@@ -16,8 +16,6 @@ This is a good way to make sure that proposed changes will be accepted.
 Resources
 =========
 
-See :ref:`aesara-community` for a list of Aesara resources.
-
 The Theano Google group is also relevant to (early) Aesara versions:
 `theano-dev`_.
 
@@ -68,16 +66,13 @@ Documentation and docstrings
   docstrings of all the classes and functions should respect the
   `PEP257 <https://www.python.org/dev/peps/pep-0257/>`_ rules and follow the
   `Numpy docstring standard
-  <https://github.com/numpy/numpy/blob/master/doc/HOWTO_DOCUMENT.rst.txt>`_.
+  <https://numpydoc.readthedocs.io/en/latest/format.html#docstring-standard>`_.
 
 * To cross-reference other objects (e.g. reference other classes or methods) in
   the docstrings, use the
   `cross-referencing objects <http://www.sphinx-doc.org/en/stable/domains.html#cross-referencing-python-objects>`_
   syntax. ``:py`` can be omitted, see e.g. this
   `stackoverflow answer <http://stackoverflow.com/a/7754189>`_.
-
-* See :ref:`metadocumentation`, for some information on how to generate the
-  documentation.
 
 
 A Docstring Example
@@ -152,6 +147,22 @@ with the following:
     You can choose a name other than "upstream" to reference the official Aesara
     repository.
 
+We also have to pull the necessary tags like so:
+
+.. code-block:: bash
+
+    git fetch -t --all
+
+.. note::
+
+    If an error along the lines of `errno=Operation timed out` occurs here, then you
+    may need to run 
+    
+    .. code-block:: bash
+        
+        git remote set-url upstream https://github.com/aesara-devs/aesara.git
+        git fetch -t --all
+
 Setting up the your local development environment
 -------------------------------------------------
 
@@ -159,6 +170,10 @@ You will need to create a virtual environment and install the project requiremen
 
 The recommended approach is to install `conda <https://conda.io/projects/conda/en/latest/user-guide/install/index.html>`_ and
 create a virtual environment in the project directory:
+
+.. note::
+
+    For computers using an ARM processor, replace the `environment.yml` below with `environment-arm.yml`.
 
 .. code-block:: bash
 
@@ -191,6 +206,36 @@ For a general guide on how to provide open source contributions see `here
 <https://opensource.guide/how-to-contribute/#how-to-submit-a-contribution>`_.
 For a good overview of the development workflow (e.g. relevant ``git`` commands)
 see the `NumPy development guide <https://numpy.org/doc/stable/dev/>`_.
+
+
+Contributing to the documentation
+---------------------------------
+
+To contribute to the documentation, first follow the instructions in the previous section. Afterward, you can install the documentation dependencies in the virtual environment you created:
+
+
+.. code-block:: bash
+
+    pip install -r requirements-rtd.txt
+
+
+You can now build the documentation from the root of the project with:
+
+
+.. code-block:: bash
+
+    python doc/scripts/docgen.py
+
+
+Afterward, you can go to `html/index.html` and navigate the changes in a browser. One way to do this is to go to the `html` directory and run:
+
+
+.. code-block:: bash
+
+    python -m http.server
+
+**Do not commit the `html` directory. The documentation is built automatically.**
+
 
 Other tools that might help
 ===========================
